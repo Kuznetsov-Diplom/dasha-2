@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс
+Dasha v2 — Gradio интерфейс v2.2
+Полностью исправлены баги, 39-мерный вектор, consistent UI
 """
 import gradio as gr
 import numpy as np
@@ -25,7 +26,7 @@ def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go
     return fig
 
 
-def create_vector_bar_plot(vector: list, title: str = "38-мерный вектор признаков") -> go.Figure:
+def create_vector_bar_plot(vector: list, title: str = "39-мерный вектор признаков (CMVN + RASTA)") -> go.Figure:
     fig = go.Figure()
     colors = ["#FF6B6B" if v > 0.7 else "#4ECDC4" for v in vector]
     fig.add_trace(go.Bar(x=[f"F{i+1}" for i in range(len(vector))], y=vector, marker_color=colors, text=[f"{v:.2f}" for v in vector], textposition="outside", textfont=dict(size=9)))
@@ -33,9 +34,9 @@ def create_vector_bar_plot(vector: list, title: str = "38-мерный вект�
     return fig
 
 
-def create_mfcc_heatmap(mfcc: np.ndarray, title: str = "MFCC + RASTA спектрограмма") -> go.Figure:
+def create_mfcc_heatmap(mfcc: np.ndarray, title: str = "RASTA-MFCC + CMVN") -> go.Figure:
     fig = go.Figure(data=go.Heatmap(z=mfcc, colorscale="Viridis", colorbar=dict(title="Значение")))
-    fig.update_layout(title=title, xaxis_title="Кадры", yaxis_title="MFCC коэффициенты (0-12)", height=260, margin=dict(l=40, r=20, t=40, b=30))
+    fig.update_layout(title=title, xaxis_title="Кадры", yaxis_title="MFCC коэффициенты (1-13)", height=260, margin=dict(l=40, r=20, t=40, b=30))
     return fig
 
 
@@ -62,13 +63,13 @@ def process_single_phrase(audio, use_rasta, file_path=None):
     try:
         result = pipeline.extract_features(path)
         vec = result["normalized_vector"]
-        mfcc = result.get("mfcc_rasta", np.zeros((12, 10)))
-        md = f"**✅ Обработка завершена** (RASTA: {'вкл' if use_rasta else 'выкл'}) | Длина вектора: **39** | [0, 1]"
+        mfcc = result.get("mfcc_rasta", np.zeros((13, 10)))
+        md = f"**✅ Обработка завершена** (RASTA+CMVN: {'вкл' if use_rasta else 'выкл'}) | Длина вектора: **39** | [0, 1]"
         fig_wave = create_waveform_plot(result["y_pre"], result["sr"], "Предобработанный сигнал")
-        fig_vec = create_vector_bar_plot(vec, "Нормализованный 38-мерный вектор")
-        fig_mfcc = create_mfcc_heatmap(mfcc[:13], "RASTA-MFCC")
+        fig_vec = create_vector_bar_plot(vec, "Нормализованный 39-мерный вектор")
+        fig_mfcc = create_mfcc_heatmap(mfcc, "RASTA-MFCC + CMVN")
         quality = pipeline.get_feature_quality_metrics([np.array(vec)])
-        quality_md = f"**Quality:** cosine = {quality.get('mean_cosine_similarity', 'N/A')} | corr = {quality.get('mean_feature_correlation', 'N/A')}"
+        quality_md = f"**Quality:** cosine = {quality.get('mean_cosine_similarity', 'N/A')} | corr = {quality.get('mean_feature_correlation', 'N/A')} | var = {quality.get('feature_variance_proxy', 'N/A')}"
         return md, fig_wave, fig_vec, fig_mfcc, quality_md
     except Exception as e:
         return f"Ошибка: {str(e)}", None, None, None, ""
@@ -93,8 +94,8 @@ def process_correlation(files, use_rasta):
     mean_vec = np.mean(arr, axis=0)
     fig_lines = go.Figure()
     for i, v in enumerate(vectors):
-        fig_lines.add_trace(go.Scatter(x=list(range(len(vector))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7))
-    fig_lines.add_trace(go.Scatter(x=list(range(len(vector))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
+        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7))
+    fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
     fig_lines.update_layout(title="Векторы vs Средний эталон", height=320, template="plotly_white")
     md = f"**Обработано {len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}**"
     return md, fig_corr, fig_lines
@@ -124,9 +125,9 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     fig_heat = create_correlation_heatmap(all_vectors[:15], speaker_labels[:15])
     fig_lines = go.Figure()
     for i, v in enumerate(all_vectors[:min(12, len(all_vectors))]):
-        fig_lines.add_trace(go.Scatter(x=list(range(len(vector))), y=v, mode="lines", name=speaker_labels[i], opacity=0.6))
+        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines", name=speaker_labels[i], opacity=0.6))
     fig_lines.update_layout(title="Примеры векторов (демо)", height=280, template="plotly_white")
-    quality_md = f"**Ресеарч:** Низкая корреляция признаков = высокая энтропия для ключей НПБК. RASTA значительно повышает intra-стабильность."
+    quality_md = f"**Ресеарч:** Низкая корреляция признаков = высокая энтропия для ключей НПБК. RASTA+CMVN значительно повышает intra-стабильность."
     return md, fig_heat, fig_lines, quality_md
 
 
@@ -140,10 +141,10 @@ def train_normalizer(max_speakers, phrases):
     return f"✅ Нормализатор обучен на {len(fake_vectors)} синтетических векторах. Параметры сохранены."
 
 
-with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **Полностью переписана с нуля.** Научно обоснованный пайплайн (RASTA + правильный mean pooling + глобальная нормализация).  
+    **v2.2 — полностью исправленный пайплайн (RASTA + CMVN, 39-мерный без энергии).**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -153,13 +154,13 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
                 with gr.Column(scale=1):
                     gr.Markdown("### Ввод голоса")
                     audio_in = gr.Audio(sources=["microphone", "upload"], type="numpy", label="Запишите или загрузите .wav")
-                    use_rasta_cb = gr.Checkbox(value=True, label="Использовать RASTA-фильтрацию (рекомендуется)")
-                    btn_process = gr.Button("🚀 Извлечь 38-мерный вектор", variant="primary")
+                    use_rasta_cb = gr.Checkbox(value=True, label="Использовать RASTA+CMVN (рекомендуется)")
+                    btn_process = gr.Button("🚀 Извлечь 39-мерный вектор", variant="primary")
                 with gr.Column(scale=2):
                     out_md = gr.Markdown()
                     out_wave = gr.Plot(label="Сигнал")
-                    out_vec = gr.Plot(label="38-мерный вектор")
-                    out_mfcc = gr.Plot(label="RASTA-MFCC")
+                    out_vec = gr.Plot(label="39-мерный вектор")
+                    out_mfcc = gr.Plot(label="RASTA-MFCC + CMVN")
                     out_quality = gr.Markdown()
 
             btn_process.click(process_single_phrase, inputs=[audio_in, use_rasta_cb], outputs=[out_md, out_wave, out_vec, out_mfcc, out_quality])
@@ -169,7 +170,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
                 with gr.Column(scale=1):
                     gr.Markdown("### Загрузите 3–6 записей одного спикера")
                     files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы")
-                    use_rasta2 = gr.Checkbox(value=True, label="RASTA")
+                    use_rasta2 = gr.Checkbox(value=True, label="RASTA+CMVN")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
                 with gr.Column(scale=2):
                     corr_md = gr.Markdown()
@@ -184,7 +185,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
                     gr.Markdown("### Параметры теста (демо на синтетике)")
                     num_sp = gr.Slider(2, 12, value=5, step=1, label="Количество спикеров")
                     ph_per = gr.Slider(3, 15, value=8, step=1, label="Фраз на спикера")
-                    use_rasta3 = gr.Checkbox(value=True, label="RASTA")
+                    use_rasta3 = gr.Checkbox(value=True, label="RASTA+CMVN")
                     btn_test = gr.Button("Запустить тест ГОСТ + Research", variant="primary")
                 with gr.Column(scale=2):
                     test_md = gr.Markdown()
@@ -210,14 +211,14 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("5. НПБК (в разработке)"):
             gr.Markdown("""
             ### Нейросетевой преобразователь «биометрия-код» (ГОСТ Р 52633.5)
-            **Текущий статус:** Заглушка. Вектор из вкладки 1 готов к подаче на вход двухслойной нейросети.
+            **Текущий статус:** Заглушка. 39-мерный вектор из вкладки 1 готов к подаче на вход двухслойной нейросети.
             """)
             gr.Button("Сгенерировать ключ (заглушка)", interactive=False)
 
     gr.Markdown("""
     ---
-    **Dasha v2** — полностью переписана с нуля в мае 2026.
+    **Dasha v2 v2.2** — исправлены все баги в UI и пайплайне. Май 2026.
     """)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
