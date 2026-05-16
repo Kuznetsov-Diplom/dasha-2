@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Датасеты и большие данные (ВАЖНО: не пушим в репозиторий)
+data/
+datasets/
+dataset/
+CommonVoice*/
+cv_*/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+models/audio_params/*.json
+models/audio_params/*.pkl
+models/audio_params/*.npy
+
+# Логи и временные файлы
+*.log
+tmp/
+temp/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
