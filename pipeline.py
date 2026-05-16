@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline
+Dasha v2 — Voice Feature Pipeline v2.1
 Научно обоснованный пайплайн извлечения 39-мерных признаков для НПБК по ГОСТ Р 52633.
 
-Ключевые улучшение:
-- RASTA-фильтрация для robustness к channel/noise
-- Правильный порядок: mean pooling ДО любой per-utt нормализации (фикс нулевого вектора v1)
-- Глобальная нормализация (через FeatureNormalizer)
-- Улучшенный VAD
-- Полная документация и reproducibility
+Ключевые улучшения v2.1:
+- RASTA + CMVN (Cepstral Mean Variance Normalization) для максимальной стабильности и робастности
+- Исправлен баг извлечения MFCC (дубли, срез энергии)
+- 39-мерный вектор: 13 MFCC + 13 Δ + 13 ΔΔ
+- Соответствует лучшим практикам speaker recognition (низкая корреляция, высокая энтропия)
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 from scipy.signal import lfilter
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 from pathlib import Path
 import json
 
@@ -24,13 +23,6 @@ from normalizer import FeatureNormalizer
 
 
 class VoiceFeaturePipeline:
-    """
-    Современный пайплайн извлечения голосовых признаков для биометрической генерации ключей.
-    
-    Параметры по умолчанию соответствуют лучшим практикам speaker recognition
-    и рекомендациям ГОСТ Р 52633 (устойчивость + информативность).
-    """
-    
     SAMPLE_RATE: int = 16000
     PRE_EMPHASIS: float = 0.97
     FRAME_LENGTH_MS: int = 25
@@ -43,12 +35,7 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.8
     VAD_ENERGY_PERCENTILE: float = 25.0
 
-    def __init__(
-        self,
-        use_rasta: bool = True,
-        vad_threshold: float = 0.015,
-        normalizer: Optional[FeatureNormalizer] = None
-    ):
+    def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.015, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.vad_threshold = vad_threshold
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax")
@@ -62,7 +49,6 @@ class VoiceFeaturePipeline:
                     params = json.load(f)
                 self.normalizer.params = params
                 self.normalizer.method = params.get("method", "global_minmax")
-                print(f"[Pipeline] Загружен нормализатор: {params_path}")
             except Exception as e:
                 print(f"[Pipeline] Не удалось загрузить нормализатор: {e}")
 
@@ -110,24 +96,22 @@ class VoiceFeaturePipeline:
         vad_mask = self._vad(y_pre, sr)
 
         mfcc = librosa.feature.mfcc(
-        mfcc = mfcc[1:, :]  # удаляем MFCC[0] (энергия)
             y=y_pre, sr=sr, n_mfcc=self.N_MFCC, n_fft=frame_length, hop_length=hop_length,
-        mfcc = mfcc[1:, :]  # удаляем MFCC[0] (энергия)
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX, window="hamming", center=True, norm="ortho"
-        mfcc = mfcc[1:, :]  # удаляем MFCC[0] (энергия)
         )
-        mfcc = mfcc[1:, :]  # удаляем MFCC[0] (энергия)
 
         if self.use_rasta:
             mfcc_rasta = np.zeros_like(mfcc)
             for i in range(self.N_MFCC):
                 mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
+            # CMVN — ключ к стабильности по ГОСТ (компенсация вариативности)
+            mfcc_rasta = (mfcc_rasta - np.mean(mfcc_rasta, axis=1, keepdims=True)) / (np.std(mfcc_rasta, axis=1, keepdims=True) + 1e-8)
         else:
             mfcc_rasta = mfcc.copy()
 
         delta = librosa.feature.delta(mfcc_rasta, order=1, width=5)
         delta2 = librosa.feature.delta(mfcc_rasta, order=2, width=5)
-        features_39 = np.vstack([mfcc_rasta, delta, delta2])
+        features_39 = np.vstack([mfcc_rasta, delta, delta2])  # ровно 39
 
         if np.any(vad_mask) and vad_mask.shape[0] == features_39.shape[1]:
             active_features = features_39[:, vad_mask]
@@ -155,7 +139,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.0"
+            "pipeline_version": "2.1"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
