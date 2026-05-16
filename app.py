@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.2
-Полностью исправлены баги, 39-мерный вектор, consistent UI
+Dasha v2 — Gradio интерфейс v2.3
+Убрано ограничение на 6 файлов во вкладке 2
 """
 import gradio as gr
 import numpy as np
@@ -81,7 +81,7 @@ def process_correlation(files, use_rasta):
     if not files or len(files) < 2:
         return "Загрузите минимум 2 файла", None, None
     vectors, labels = [], []
-    for i, f in enumerate(files[:6]):
+    for i, f in enumerate(files):  # УБРАНО [:6] — теперь все файлы обрабатываются
         try:
             res = pipeline.extract_features(f)
             vectors.append(res["normalized_vector"])
@@ -144,7 +144,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.2 — полностью исправленный пайплайн (RASTA + CMVN, 39-мерный без энергии).**  
+    **v2.3 — robust нормализация + без ограничений на файлы.**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -168,7 +168,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("2. Корреляция и стабильность"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Загрузите 3–6 записей одного спикера")
+                    gr.Markdown("### Загрузите любое количество записей одного спикера (без ограничений)")
                     files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы")
                     use_rasta2 = gr.Checkbox(value=True, label="RASTA+CMVN")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
@@ -217,7 +217,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.2** — исправлены все баги в UI и пайплайне. Май 2026.
+    **Dasha v2 v2.3** — robust нормализация + без ограничений на файлы. Май 2026.
     """)
 
 if __name__ == "__main__":
