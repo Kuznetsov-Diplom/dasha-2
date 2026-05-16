@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.2
-Научно обоснованный пайплайн извлечения 39-мерных признаков для НПБК по ГОСТ Р 52633.
+Dasha v2 — Voice Feature Pipeline v2.3
 
-Ключевые улучшения v2.2:
-- Удалён MFCC[0] (энергия) — теперь все 39 признаков сбалансированы (F1 больше не доминирует)
-- n_mfcc=14 → 13 speaker-specific + 13 Δ + 13 ΔΔ = 39
-- RASTA + CMVN на чистых кепстральных коэффициентах
-- F1 теперь ~0.25-0.35 как остальные (высокая энтропия, низкая корреляция)
+Ключевые улучшения v2.3:
+- Улучшен fallback нормализации (robust percentile 5-95%) — бары теперь более разнообразные, меньше "прямой линии"
+- Высокая энтропия и разделимость признаков для НПБК
 """
 
 from __future__ import annotations
@@ -27,7 +24,7 @@ class VoiceFeaturePipeline:
     PRE_EMPHASIS: float = 0.97
     FRAME_LENGTH_MS: int = 25
     FRAME_SHIFT_MS: int = 10
-    N_MFCC: int = 14  # 14 → после среза энергии = 13 чистых MFCC
+    N_MFCC: int = 14
     N_MELS: int = 40
     FMIN: float = 20.0
     FMAX: float = 8000.0
@@ -99,11 +96,11 @@ class VoiceFeaturePipeline:
             y=y_pre, sr=sr, n_mfcc=self.N_MFCC, n_fft=frame_length, hop_length=hop_length,
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX, window="hamming", center=True, norm="ortho"
         )
-        mfcc = mfcc[1:, :]  # УДАЛЯЕМ энергию (MFCC[0]) — теперь все признаки сбалансированы!
+        mfcc = mfcc[1:, :]
 
         if self.use_rasta:
             mfcc_rasta = np.zeros_like(mfcc)
-            for i in range(mfcc.shape[0]):  # 13
+            for i in range(mfcc.shape[0]):
                 mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
             mfcc_rasta = (mfcc_rasta - np.mean(mfcc_rasta, axis=1, keepdims=True)) / (np.std(mfcc_rasta, axis=1, keepdims=True) + 1e-8)
         else:
@@ -111,7 +108,7 @@ class VoiceFeaturePipeline:
 
         delta = librosa.feature.delta(mfcc_rasta, order=1, width=5)
         delta2 = librosa.feature.delta(mfcc_rasta, order=2, width=5)
-        features_39 = np.vstack([mfcc_rasta, delta, delta2])  # 13 + 13 + 13 = 39
+        features_39 = np.vstack([mfcc_rasta, delta, delta2])
 
         if np.any(vad_mask) and vad_mask.shape[0] == features_39.shape[1]:
             active_features = features_39[:, vad_mask]
@@ -123,12 +120,12 @@ class VoiceFeaturePipeline:
         if self.normalizer.params is not None:
             normalized = self.normalizer.transform(mean_vector)
         else:
-            min_v = np.min(mean_vector)
-            max_v = np.max(mean_vector)
-            if max_v - min_v < 1e-8:
+            # Robust scaling (5-95 percentile) — больше разнообразия в барах, меньше "прямой линии"
+            q_low, q_high = np.percentile(mean_vector, [5, 95])
+            if q_high - q_low < 1e-8:
                 normalized = np.full(39, 0.5, dtype=np.float32)
             else:
-                normalized = (mean_vector - min_v) / (max_v - min_v)
+                normalized = np.clip((mean_vector - q_low) / (q_high - q_low), 0.0, 1.0)
 
         return {
             "normalized_vector": normalized.tolist(),
@@ -139,7 +136,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.2"
+            "pipeline_version": "2.3"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
