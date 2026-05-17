@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-FeatureNormalizer — глобальная нормализация 39-мерных голосовых векторов.
+FeatureNormalizer — глобальная нормализация N-мерных голосовых векторов (текущая версия: 26-мерные).
 
 Поддерживает:
 - global_minmax (рекомендуется для [0,1] и визуализации)
 - standard (mean=0, std=1 — лучше для нейросетей)
 
 Сохраняет/загружает параметры в JSON для reproducibility и отменяемости.
+
+Теперь полностью совместим с текущим pipeline (26 mean+std после MFCC+RASTA).
 """
 
 import numpy as np
@@ -19,6 +21,7 @@ class FeatureNormalizer:
     """
     Глобальной нормализатор признаков.
     Обучается на большой выборке векторов разных спикеров.
+    Поддерживает любую размерность (26, 39 и др.).
     """
 
     def __init__(self, method: str = "global_minmax"):
@@ -27,10 +30,10 @@ class FeatureNormalizer:
 
     def fit(self, vectors: np.ndarray) -> None:
         """
-        vectors: np.ndarray shape (N_samples, 39)
+        vectors: np.ndarray shape (N_samples, D) — любая D (26 в текущей версии)
         """
-        if vectors.ndim != 2 or vectors.shape[1] != 39:
-            raise ValueError("Ожидается массив (N, 39)")
+        if vectors.ndim != 2 or vectors.shape[1] < 1:
+            raise ValueError(f"Ожидается массив (N, D) с D >= 1, получено {vectors.shape}")
 
         if self.method == "global_minmax":
             self.params = {
