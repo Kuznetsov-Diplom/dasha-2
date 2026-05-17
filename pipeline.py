@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.14 (GOST-friendly + CMVN)
+Dasha v2 — Voice Feature Pipeline v2.16 (39-мерный вектор)
 
-- 13 MFCC (без энергии) + RASTA + per-utterance CMVN
-- mean + std = 26-мерный вектор
-- CMVN сильно улучшает разделимость спикеров (решает проблему высокой inter-correlation)
-- Финальная нормализация: Standard (Z-score) по умолчанию
-- Готово для НПБК по ГОСТ Р 52633
+- 13 MFCC + 13 Δ + 13 ΔΔ = 39 коэффициентов
+- mean + std = 78-мерный вектор
+- + per-utterance CMVN + RASTA
+- Это классический подход для speaker recognition
+- Должно дать значительно лучшую разделимость
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ class VoiceFeaturePipeline:
     def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.vad_threshold = vad_threshold
-        self.normalizer = normalizer or FeatureNormalizer(method="standard")  # теперь standard по умолчанию
+        self.normalizer = normalizer or FeatureNormalizer(method="standard")
         self._load_normalizer_if_exists()
 
     def _load_normalizer_if_exists(self) -> None:
@@ -89,11 +89,9 @@ class VoiceFeaturePipeline:
 
     @staticmethod
     def _cmvn(mfcc: np.ndarray, window: int = 301) -> np.ndarray:
-        """Cepstral Mean and Variance Normalization (per utterance)."""
         mfcc = mfcc.astype(np.float32)
         if mfcc.shape[1] < window:
             window = mfcc.shape[1]
-        # скользящее среднее и std
         mean = np.convolve(mfcc.mean(axis=0), np.ones(window)/window, mode='same')
         std = np.convolve(mfcc.std(axis=0), np.ones(window)/window, mode='same') + 1e-8
         return (mfcc - mean) / std
@@ -117,13 +115,14 @@ class VoiceFeaturePipeline:
         hop_length = int(self.FRAME_SHIFT_MS * sr / 1000)
         vad_mask = self._vad(y_pre, sr)
 
+        # === 13 MFCC ===
         mfcc = librosa.feature.mfcc(
             y=y_pre, sr=sr, n_mfcc=self.N_MFCC + 1,
             n_fft=frame_length, hop_length=hop_length,
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX,
             window="hamming", center=True, norm="ortho"
         )
-        mfcc = mfcc[1:, :]   # убираем энергию
+        mfcc = mfcc[1:, :]
 
         if self.use_rasta:
             mfcc_rasta = np.zeros_like(mfcc)
@@ -132,38 +131,44 @@ class VoiceFeaturePipeline:
         else:
             mfcc_rasta = mfcc.copy()
 
-        # === НОВОЕ: per-utterance CMVN (ключ к разделимости спикеров) ===
+        # === per-utterance CMVN ===
         mfcc_norm = self._cmvn(mfcc_rasta)
 
-        if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
-            active = mfcc_norm[:, vad_mask]
-        else:
-            active = mfcc_norm
+        # === Добавляем дельты ===
+        delta = librosa.feature.delta(mfcc_norm, width=9, mode='interp')
+        delta2 = librosa.feature.delta(mfcc_norm, order=2, width=9, mode='interp')
 
-        mean_vec = np.mean(active, axis=1)
-        std_vec  = np.std(active, axis=1) + 1e-8
-        features_26 = np.concatenate([mean_vec, std_vec])
+        # 13 + 13 + 13 = 39 коэффициентов
+        features_39 = np.vstack([mfcc_norm, delta, delta2])
+
+        if np.any(vad_mask) and vad_mask.shape[0] == features_39.shape[1]:
+            active = features_39[:, vad_mask]
+        else:
+            active = features_39
+
+        mean_vec = np.mean(active, axis=1)           # 39
+        std_vec  = np.std(active, axis=1) + 1e-8     # 39
+        features_78 = np.concatenate([mean_vec, std_vec])  # 78-мерный вектор
 
         if self.normalizer.params is not None:
-            normalized = self.normalizer.transform(features_26)
+            normalized = self.normalizer.transform(features_78)
         else:
-            # fallback robust scaling
-            q_low, q_high = np.percentile(features_26, [5, 95])
+            q_low, q_high = np.percentile(features_78, [5, 95])
             if q_high - q_low < 1e-8:
-                normalized = np.full(26, 0.5, dtype=np.float32)
+                normalized = np.full(78, 0.5, dtype=np.float32)
             else:
-                normalized = np.clip((features_26 - q_low) / (q_high - q_low), 0.0, 1.0)
+                normalized = np.clip((features_78 - q_low) / (q_high - q_low), 0.0, 1.0)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": features_26,
+            "raw_mean_vector": features_78,
             "mfcc_rasta": mfcc_rasta,
-            "features_26": features_26,
+            "features_78": features_78,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.14"
+            "pipeline_version": "2.16 (39-dim)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
