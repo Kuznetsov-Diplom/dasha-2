@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.24
+Dasha v2 — Voice Feature Pipeline v2.25 FINAL
 
-- RASTA по умолчанию ВЫКЛЮЧЕН (use_rasta=False)
-- 26-dim или 39-dim (+Δ+ΔΔ)
-- per-utterance CMVN всегда включен
-- Готов к экспериментам и НПБК
+- 26-dim (13 mean + 13 std) — официальный вектор проекта
+- RASTA = OFF (наилучшая разделимость)
+- per-utterance CMVN
+- Готов к НПБК
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ class VoiceFeaturePipeline:
     N_MELS: int = 40
     FMIN: float = 20.0
     FMAX: float = 8000.0
-    RASTA_POLE: float = 0.94
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
@@ -82,12 +81,6 @@ class VoiceFeaturePipeline:
         return speech_mask
 
     @staticmethod
-    def _rasta_filter(trajectory: np.ndarray, pole: float = 0.94) -> np.ndarray:
-        b = np.array([0.1, -0.1])
-        a = np.array([1.0, -pole])
-        return lfilter(b, a, trajectory)
-
-    @staticmethod
     def _cmvn(mfcc: np.ndarray, window: int = 301) -> np.ndarray:
         mfcc = mfcc.astype(np.float32)
         if mfcc.shape[1] < window:
@@ -123,14 +116,7 @@ class VoiceFeaturePipeline:
         )
         mfcc = mfcc[1:, :]
 
-        if self.use_rasta:
-            mfcc_rasta = np.zeros_like(mfcc)
-            for i in range(self.N_MFCC):
-                mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
-        else:
-            mfcc_rasta = mfcc.copy()
-
-        mfcc_norm = self._cmvn(mfcc_rasta)
+        mfcc_norm = self._cmvn(mfcc)
 
         if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
             active = mfcc_norm[:, vad_mask]
@@ -148,26 +134,25 @@ class VoiceFeaturePipeline:
             mean_d2 = np.mean(delta2, axis=1)
             std_d2  = np.std(delta2, axis=1) + 1e-8
             features = np.concatenate([mean_vec, std_vec, mean_d1, std_d1, mean_d2, std_d2])
-            dim_label = "39-dim (MFCC + Δ + ΔΔ)"
+            dim_label = "39-dim (experimental)"
         else:
             features = np.concatenate([mean_vec, std_vec])
-            dim_label = "26-dim (MFCC only)"
+            dim_label = "26-dim (official)"
 
         normalized = features.astype(np.float32)
 
         return {
             "normalized_vector": normalized.tolist(),
             "raw_mean_vector": features,
-            "mfcc_rasta": mfcc_rasta,
+            "mfcc_rasta": mfcc_norm,
             "features": features,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
-            "use_rasta": self.use_rasta,
             "use_deltas": self.use_deltas,
             "dim": len(features),
             "dim_label": dim_label,
-            "pipeline_version": "2.24 (RASTA=OFF by default, 26/39-dim)"
+            "pipeline_version": "2.25 FINAL (26-dim, RASTA=OFF)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -191,6 +176,6 @@ class VoiceFeaturePipeline:
         }
 
 
-def process_phrase(audio_path: str | Path, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
-    pipeline = VoiceFeaturePipeline(use_rasta=use_rasta, use_deltas=use_deltas, normalizer=normalizer)
+def process_phrase(audio_path: str | Path, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
+    pipeline = VoiceFeaturePipeline(use_deltas=use_deltas, normalizer=normalizer)
     return pipeline.extract_features(audio_path)
