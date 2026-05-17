@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.5
-Хитмап корреляций теперь от 0 до 1 (только положительные значения)
+Dasha v2 — Gradio интерфейс v2.6
+Небольшой полиш: обновлены подписи, добавлено объяснение пайплайна
 """
 import gradio as gr
 import numpy as np
@@ -35,7 +35,7 @@ def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go
     return fig
 
 
-def create_vector_bar_plot(vector: list, title: str = "39-мерный вектор признаков (RASTA + Дельты)") -> go.Figure:
+def create_vector_bar_plot(vector: list, title: str = "39-мерный вектор (RASTA + Дельты, без CMVN)") -> go.Figure:
     fig = go.Figure()
     colors = ["#FF6B6B" if v > 0.7 else "#4ECDC4" for v in vector]
     fig.add_trace(go.Bar(x=[f"F{i+1}" for i in range(len(vector))], y=vector, marker_color=colors, text=[f"{v:.2f}" for v in vector], textposition="outside", textfont=dict(size=9)))
@@ -43,7 +43,7 @@ def create_vector_bar_plot(vector: list, title: str = "39-мерный вект�
     return fig
 
 
-def create_mfcc_heatmap(mfcc: np.ndarray, title: str = "RASTA-MFCC") -> go.Figure:
+def create_mfcc_heatmap(mfcc: np.ndarray, title: str = "RASTA-MFCC (13 коэф. + дельты)") -> go.Figure:
     fig = go.Figure(data=go.Heatmap(z=mfcc, colorscale="Viridis", colorbar=dict(title="Значение")))
     fig.update_layout(title=title, xaxis_title="Кадры", yaxis_title="MFCC коэффициенты (1-13)", height=260, margin=dict(l=40, r=20, t=40, b=30))
     return fig
@@ -52,9 +52,8 @@ def create_mfcc_heatmap(mfcc: np.ndarray, title: str = "RASTA-MFCC") -> go.Figur
 def create_correlation_heatmap(vectors: list, labels: list) -> go.Figure:
     arr = np.array(vectors)
     corr = np.corrcoef(arr)
-    # Шкала от 0 до 1 — для наглядности положительных корреляций одного спикера
     fig = go.Figure(data=go.Heatmap(z=corr, x=labels, y=labels, colorscale="RdYlBu_r", zmin=0, zmax=1, colorbar=dict(title="Корреляция")))
-    fig.update_layout(title="Матрица корреляций векторов", height=380, margin=dict(l=60, r=20, t=40, b=60))
+    fig.update_layout(title="Матрица корреляций векторов (0–1)", height=380, margin=dict(l=60, r=20, t=40, b=60))
     return fig
 
 
@@ -74,10 +73,10 @@ def process_single_phrase(audio, use_rasta, file_path=None):
         result = pipeline.extract_features(path)
         vec = result["normalized_vector"]
         mfcc = result.get("mfcc_rasta", np.zeros((13, 10)))
-        md = f"**✅ Обработка завершена** (RASTA+CMVN: {'вкл' if use_rasta else 'выкл'}) | Длина вектора: **39** | [0, 1]"
+        md = f"**✅ Обработка завершена** (RASTA: {'вкл' if use_rasta else 'выкл'}) | Длина вектора: **39** | [0, 1]"
         fig_wave = create_waveform_plot(result["y_pre"], result["sr"], "Предобработанный сигнал")
-        fig_vec = create_vector_bar_plot(vec, "Нормализованный 39-мерный вектор")
-        fig_mfcc = create_mfcc_heatmap(mfcc, "RASTA-MFCC")
+        fig_vec = create_vector_bar_plot(vec)
+        fig_mfcc = create_mfcc_heatmap(mfcc)
         quality = pipeline.get_feature_quality_metrics([np.array(vec)])
         quality_md = f"**Quality:** cosine = {quality.get('mean_cosine_similarity', 'N/A')} | corr = {quality.get('mean_feature_correlation', 'N/A')} | var = {quality.get('feature_variance_proxy', 'N/A')}"
         return md, fig_wave, fig_vec, fig_mfcc, quality_md
@@ -154,7 +153,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.5 — улучшенный пайплайн (без внутреннего CMVN) + хитмап корреляций от 0 до 1.**  
+    **v2.6 — пайплайн улучшен (RASTA + Дельты, без CMVN) → вектор лучше отражает особенности голоса.**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -178,7 +177,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("2. Корреляция и стабильность"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Загрузите любое количество записей одного спикера (без ограничений)")
+                    gr.Markdown("### Загрузите любое количество записей одного спикера")
                     files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы")
                     use_rasta2 = gr.Checkbox(value=True, label="RASTA")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
@@ -227,7 +226,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.5** — пайплайн улучшен для лучшей различимости голоса. Май 2026.
+    **Dasha v2 v2.6** — пайплайн улучшен для лучшей различимости голоса. Май 2026.
     """)
 
 if __name__ == "__main__":
