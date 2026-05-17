@@ -30,12 +30,12 @@ services:
     ports:
       - "7860:7860"
 
-  # Умная админка PostgreSQL (pgAdmin) — отдельный сервис
+  # pgAdmin — умная админка PostgreSQL (port 5050)
   pgadmin:
     image: dpage/pgadmin4:latest
     restart: always
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@dasha.local
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
       PGADMIN_DEFAULT_PASSWORD: admin123
     ports:
       - "5050:80"
