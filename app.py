@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.20
+Dasha v2 — Gradio интерфейс v2.21
 
-- 26-мерный вектор (MFCC only) — победитель эксперимента
-- Вкладки 1 и 2: выбор спикера из датасета + кнопка "Случайный спикер"
+- 26-мерный вектор (MFCC only) — победитель
+- Вкладки 1 и 2: два режима — "Своя запись" и "Из датасета"
 - Готово к нормализации и НПБК
 """
 import gradio as gr
@@ -12,7 +12,6 @@ import plotly.graph_objects as go
 import tempfile
 import random
 from pathlib import Path
-from typing import List, Tuple, Optional
 import soundfile as sf
 
 from pipeline import VoiceFeaturePipeline
@@ -30,7 +29,6 @@ except Exception as e:
     print(f"⚠️  {e}")
     global_speakers = {}
 
-# Подготовка списка спикеров для выбора
 def get_speaker_list():
     if not global_speakers:
         return []
@@ -43,7 +41,6 @@ def get_random_speaker():
         return None
     return random.choice(speaker_list)
 
-# Обучение нормализатора
 def _collect_real_vectors(max_vecs: int = 2000):
     vecs = []
     if not global_speakers:
@@ -94,11 +91,11 @@ def create_correlation_heatmap(vectors: list, labels: list) -> go.Figure:
     fig.update_layout(title="Матрица корреляций векторов (0–1)", height=380, margin=dict(l=60, r=20, t=40, b=60))
     return fig
 
-def process_single_phrase(audio, use_rasta, speaker_id=None, file_path=None):
+def process_single_phrase(mode, audio, use_rasta, speaker_id=None, file_path=None):
     global pipeline
     pipeline.use_rasta = use_rasta
     path = None
-    if speaker_id and speaker_id in global_speakers:
+    if mode == "Из датасета" and speaker_id and speaker_id in global_speakers:
         path = random.choice(global_speakers[speaker_id])
     elif audio is not None:
         sr, y = audio
@@ -108,12 +105,12 @@ def process_single_phrase(audio, use_rasta, speaker_id=None, file_path=None):
     elif file_path:
         path = file_path
     else:
-        return "Загрузите аудио или выберите спикера", None, None, None, ""
+        return "Выберите режим и запись / спикера", None, None, None, ""
     try:
         result = pipeline.extract_features(path)
         vec = result["normalized_vector"]
         mfcc = result.get("mfcc_rasta", np.zeros((13, 10)))
-        md = f"**✅ Обработка завершена** (26-мерный вектор) | RASTA+CMVN"
+        md = f"**✅ 26-мерный вектор** | {mode}"
         fig_wave = create_waveform_plot(result["y_pre"], result["sr"], "Предобработанный сигнал")
         fig_vec = create_vector_bar_plot(vec)
         fig_mfcc = create_mfcc_heatmap(mfcc)
@@ -123,16 +120,11 @@ def process_single_phrase(audio, use_rasta, speaker_id=None, file_path=None):
     except Exception as e:
         return f"Ошибка: {str(e)}", None, None, None, ""
 
-def get_random_phrase_for_speaker(speaker_id):
-    if speaker_id and speaker_id in global_speakers:
-        return random.choice(global_speakers[speaker_id])
-    return None
-
-def process_correlation(files, use_rasta, speaker_id=None):
+def process_correlation(mode, files, use_rasta, speaker_id=None):
     global pipeline
     pipeline.use_rasta = use_rasta
     paths = []
-    if speaker_id and speaker_id in global_speakers:
+    if mode == "Из датасета" and speaker_id and speaker_id in global_speakers:
         paths = random.sample(global_speakers[speaker_id], min(10, len(global_speakers[speaker_id])))
     elif files:
         paths = files
@@ -196,7 +188,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
     eer_proxy = max(0, (mean_inter - mean_intra) / (mean_intra + 1e-8) * 100)
     rms_str = ", ".join([f"{r:.3f}" for r in speaker_rms])
-    md = f"**26-мерный вектор** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
+    md = f"**26-мерный вектор** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f}"
     unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
     fig_heat = create_correlation_heatmap(speaker_means, unique_labels)
     fig_lines = go.Figure()
@@ -221,7 +213,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победитель) + НПБК") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.20 — 26-мерный вектор (MFCC only) | победитель эксперимента**  
+    **v2.21 — 26-мерный вектор (MFCC only) | два режима: Своя запись / Из датасета**  
     Готово к нормализации и НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -229,10 +221,13 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
         with gr.TabItem("1. Обработка одной фразы"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Ввод голоса или выбор спикера")
-                    audio_in = gr.Audio(sources=["microphone", "upload"], type="numpy", label="Запись или файл")
-                    speaker_dd = gr.Dropdown(choices=speaker_list, label="Или выбери спикера из датасета", interactive=True)
-                    btn_random = gr.Button("🎲 Случайный спикер", size="sm")
+                    gr.Markdown("### Режим ввода")
+                    mode1 = gr.Radio(["Своя запись", "Из датасета"], value="Своя запись", label="")
+                    with gr.Group(visible=True) as own_group:
+                        audio_in = gr.Audio(sources=["microphone", "upload"], type="numpy", label="Запись или файл")
+                    with gr.Group(visible=False) as dataset_group:
+                        speaker_dd = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
+                        btn_random = gr.Button("🎲 Случайный спикер", size="sm")
                     use_rasta_cb = gr.Checkbox(value=True, label="RASTA + CMVN")
                     btn_process = gr.Button("🚀 Извлечь 26-мерный вектор", variant="primary")
                 with gr.Column(scale=2):
@@ -242,22 +237,23 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
                     out_mfcc = gr.Plot()
                     out_quality = gr.Markdown()
 
-            def load_random_speaker():
-                sid = get_random_speaker()
-                if sid:
-                    return sid
-                return gr.update()
+            def toggle_mode(mode):
+                return gr.update(visible=(mode == "Своя запись")), gr.update(visible=(mode == "Из датасета"))
 
-            btn_random.click(load_random_speaker, outputs=speaker_dd)
-            btn_process.click(process_single_phrase, inputs=[audio_in, use_rasta_cb, speaker_dd], outputs=[out_md, out_wave, out_vec, out_mfcc, out_quality])
+            mode1.change(toggle_mode, inputs=mode1, outputs=[own_group, dataset_group])
+            btn_random.click(lambda: get_random_speaker(), outputs=speaker_dd)
+            btn_process.click(process_single_phrase, inputs=[mode1, audio_in, use_rasta_cb, speaker_dd], outputs=[out_md, out_wave, out_vec, out_mfcc, out_quality])
 
         with gr.TabItem("2. Корреляция и стабильность"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Загрузка или выбор спикера")
-                    files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы (2+)")
-                    speaker_dd2 = gr.Dropdown(choices=speaker_list, label="Или выбери спикера из датасета")
-                    btn_random2 = gr.Button("🎲 Загрузить 10 фраз случайного спикера", size="sm")
+                    gr.Markdown("### Режим ввода")
+                    mode2 = gr.Radio(["Своя запись", "Из датасета"], value="Своя запись", label="")
+                    with gr.Group(visible=True) as own_group2:
+                        files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы (2+)")
+                    with gr.Group(visible=False) as dataset_group2:
+                        speaker_dd2 = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
+                        btn_random2 = gr.Button("🎲 Загрузить 10 фраз случайного спикера", size="sm")
                     use_rasta2 = gr.Checkbox(value=True, label="RASTA")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
                 with gr.Column(scale=2):
@@ -265,14 +261,12 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
                     corr_heat = gr.Plot()
                     corr_lines = gr.Plot()
 
-            def load_random_for_corr():
-                sid = get_random_speaker()
-                if sid:
-                    return sid
-                return gr.update()
+            def toggle_mode2(mode):
+                return gr.update(visible=(mode == "Своя запись")), gr.update(visible=(mode == "Из датасета"))
 
-            btn_random2.click(load_random_for_corr, outputs=speaker_dd2)
-            btn_corr.click(process_correlation, inputs=[files_in, use_rasta2, speaker_dd2], outputs=[corr_md, corr_heat, corr_lines])
+            mode2.change(toggle_mode2, inputs=mode2, outputs=[own_group2, dataset_group2])
+            btn_random2.click(lambda: get_random_speaker(), outputs=speaker_dd2)
+            btn_corr.click(process_correlation, inputs=[mode2, files_in, use_rasta2, speaker_dd2], outputs=[corr_md, corr_heat, corr_lines])
 
         with gr.TabItem("3. Массовый тест + Research"):
             with gr.Row():
@@ -308,7 +302,7 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.20** — 26-мерный вектор (победитель) | 2808 спикеров | Май 2026.
+    **Dasha v2 v2.21** — 26-мерный вектор (победитель) | два режима ввода | 2808 спикеров | Май 2026.
     """)
 
 if __name__ == "__main__":
