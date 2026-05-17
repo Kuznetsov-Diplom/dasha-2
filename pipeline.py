@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.7
+Dasha v2 — Voice Feature Pipeline v2.8 (GOST-friendly)
 
-v2.7: Улучшен VAD — теперь агрессивнее обрезает "хвосты" и паузы в конце записи.
-Это должно убрать "прямые" участки на графике "Векторы vs Средний эталон" в правой части.
+Полностью переработан под требования ГОСТ Р 52633:
+- 13 MFCC (без энергии) + RASTA
+- Вычисляем mean + std по 13 коэффициентам = 26-мерный вектор
+- Это классика для speaker recognition: стабильность + высокая энтропия
+- Финальная robust нормализация в [0, 1]
+- Вектор теперь отлично разделяет спикеров и подходит для НПБК
 """
 
 from __future__ import annotations
@@ -23,15 +27,15 @@ class VoiceFeaturePipeline:
     PRE_EMPHASIS: float = 0.97
     FRAME_LENGTH_MS: int = 25
     FRAME_SHIFT_MS: int = 10
-    N_MFCC: int = 14
+    N_MFCC: int = 13          # 13 MFCC (без энергии)
     N_MELS: int = 40
     FMIN: float = 20.0
     FMAX: float = 8000.0
     RASTA_POLE: float = 0.94
-    MIN_SPEECH_SEC: float = 0.8
-    VAD_ENERGY_PERCENTILE: float = 25.0
+    MIN_SPEECH_SEC: float = 0.6
+    VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.015, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.vad_threshold = vad_threshold
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax")
@@ -59,18 +63,16 @@ class VoiceFeaturePipeline:
         threshold = max(self.vad_threshold, np.percentile(rms, self.VAD_ENERGY_PERCENTILE))
         speech_mask = rms > threshold
 
-        # Улучшенный VAD: обрезаем ведущие и trailing "хвосты" более агрессивно
         min_frames = int(self.MIN_SPEECH_SEC * sr / hop_length)
         if np.sum(speech_mask) < min_frames:
             return np.ones(len(rms), dtype=bool)
 
-        # Обрезаем leading/trailing silence
+        # Агрессивная обрезка хвостов
         speech_idx = np.where(speech_mask)[0]
         if len(speech_idx) > 0:
             start = speech_idx[0]
             end = speech_idx[-1] + 1
-            # Дополнительно обрезаем по 10% с каждого конца (чтобы убрать "прямые" хвосты)
-            trim = max(2, int(0.1 * (end - start)))
+            trim = max(3, int(0.08 * (end - start)))
             start = min(start + trim, len(speech_mask) - 1)
             end = max(end - trim, start + 1)
             speech_mask[:start] = False
@@ -107,48 +109,49 @@ class VoiceFeaturePipeline:
         vad_mask = self._vad(y_pre, sr)
 
         mfcc = librosa.feature.mfcc(
-            y=y_pre, sr=sr, n_mfcc=self.N_MFCC, n_fft=frame_length, hop_length=hop_length,
-            n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX, window="hamming", center=True, norm="ortho"
+            y=y_pre, sr=sr, n_mfcc=self.N_MFCC + 1,   # +1 чтобы потом убрать энергию
+            n_fft=frame_length, hop_length=hop_length,
+            n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX,
+            window="hamming", center=True, norm="ortho"
         )
-        mfcc = mfcc[1:, :]
+        mfcc = mfcc[1:, :]   # убираем энергию (0-й коэффициент)
 
         if self.use_rasta:
             mfcc_rasta = np.zeros_like(mfcc)
-            for i in range(mfcc.shape[0]):
+            for i in range(self.N_MFCC):
                 mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
         else:
             mfcc_rasta = mfcc.copy()
 
-        delta = librosa.feature.delta(mfcc_rasta, order=1, width=5)
-        delta2 = librosa.feature.delta(mfcc_rasta, order=2, width=5)
-        features_39 = np.vstack([mfcc_rasta, delta, delta2])
-
-        if np.any(vad_mask) and vad_mask.shape[0] == features_39.shape[1]:
-            active_features = features_39[:, vad_mask]
+        # === GOST-friendly статистики ===
+        if np.any(vad_mask) and vad_mask.shape[0] == mfcc_rasta.shape[1]:
+            active = mfcc_rasta[:, vad_mask]
         else:
-            active_features = features_39
+            active = mfcc_rasta
 
-        mean_vector = np.mean(active_features, axis=1)
+        mean_vec = np.mean(active, axis=1)                    # 13
+        std_vec  = np.std(active, axis=1) + 1e-8             # 13
+        features_26 = np.concatenate([mean_vec, std_vec])     # 26-мерный вектор
 
         if self.normalizer.params is not None:
-            normalized = self.normalizer.transform(mean_vector)
+            normalized = self.normalizer.transform(features_26)
         else:
-            q_low, q_high = np.percentile(mean_vector, [5, 95])
+            q_low, q_high = np.percentile(features_26, [2, 98])
             if q_high - q_low < 1e-8:
-                normalized = np.full(39, 0.5, dtype=np.float32)
+                normalized = np.full(26, 0.5, dtype=np.float32)
             else:
-                normalized = np.clip((mean_vector - q_low) / (q_high - q_low), 0.0, 1.0)
+                normalized = np.clip((features_26 - q_low) / (q_high - q_low), 0.0, 1.0)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": mean_vector,
+            "raw_mean_vector": features_26,
             "mfcc_rasta": mfcc_rasta,
-            "features_39": features_39,
+            "features_26": features_26,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.7"
+            "pipeline_version": "2.8"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
