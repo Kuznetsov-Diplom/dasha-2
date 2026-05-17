@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.5
+Dasha v2 — Voice Feature Pipeline v2.7
 
-Изменения v2.5:
-- Убран внутренний CMVN (он обнулял средние значения кепстральных коэффициентов и "сглаживал" особенности голоса)
-- Теперь mean_vector сохраняет реальные уровни формант и тембра — бары стали более разнообразными и информативными
-- Оставлен только RASTA + дельты + финальная robust нормализация
+v2.7: Улучшен VAD — теперь агрессивнее обрезает "хвосты" и паузы в конце записи.
+Это должно убрать "прямые" участки на графике "Векторы vs Средний эталон" в правой части.
 """
 
 from __future__ import annotations
@@ -60,9 +58,24 @@ class VoiceFeaturePipeline:
         rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length, center=True)[0]
         threshold = max(self.vad_threshold, np.percentile(rms, self.VAD_ENERGY_PERCENTILE))
         speech_mask = rms > threshold
+
+        # Улучшенный VAD: обрезаем ведущие и trailing "хвосты" более агрессивно
         min_frames = int(self.MIN_SPEECH_SEC * sr / hop_length)
         if np.sum(speech_mask) < min_frames:
             return np.ones(len(rms), dtype=bool)
+
+        # Обрезаем leading/trailing silence
+        speech_idx = np.where(speech_mask)[0]
+        if len(speech_idx) > 0:
+            start = speech_idx[0]
+            end = speech_idx[-1] + 1
+            # Дополнительно обрезаем по 10% с каждого конца (чтобы убрать "прямые" хвосты)
+            trim = max(2, int(0.1 * (end - start)))
+            start = min(start + trim, len(speech_mask) - 1)
+            end = max(end - trim, start + 1)
+            speech_mask[:start] = False
+            speech_mask[end:] = False
+
         for i in range(1, len(speech_mask) - 1):
             if not speech_mask[i] and speech_mask[i-1] and speech_mask[i+1]:
                 speech_mask[i] = True
@@ -103,7 +116,6 @@ class VoiceFeaturePipeline:
             mfcc_rasta = np.zeros_like(mfcc)
             for i in range(mfcc.shape[0]):
                 mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
-            # CMVN УБРАН — теперь mean_vector сохраняет реальные уровни кепстральных коэффициентов (формантная структура голоса)
         else:
             mfcc_rasta = mfcc.copy()
 
@@ -136,7 +148,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.5"
+            "pipeline_version": "2.7"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
