@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Систематический эксперимент по оценке разделимости векторов
+Dasha v2 — Систематический эксперимент v2.19
 
-Цель: проверить разные способы извлечения векторов на реальных данных
+Сравнение разных способов извлечения векторов
 
-Параметры (меняй здесь):
+Параметры:
 """
 
 import os
@@ -13,24 +13,59 @@ import random
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Callable
 
 from pipeline import VoiceFeaturePipeline
 from cv_ru_loader import load_speakers_with_audio
 
-# ====================== НАСТРОЙКИ ЭКСПЕРИМЕНТА ======================
-NUM_SPEAKERS = 50          # Начально 50, потом можно 500
-NUM_ROUNDS = 3             # Начально 3, потом 5
-PHRASES_PER_SPEAKER = 10   # Фраз на спикера
-MIN_PHRASES = 10           # Минимум фраз у спикера
+from normalizer import FeatureNormalizer
+
+# ====================== НАСТРОЙКИ ======================
+NUM_SPEAKERS = 500         # 50 или 500
+NUM_ROUNDS = 5             # 3 или 5
+PHRASES_PER_SPEAKER = 10
+MIN_PHRASES = 10
+
+# ====================== ВАРИАНТЫ ИЗВлечения ======================
+VARIANTS = {
+    "26dim_baseline": {
+        "name": "26-dim (MFCC only, no deltas)",
+        "dim": 26,
+        "use_deltas": False,
+        "use_cmvn": True,
+        "normalize": False
+    },
+    "78dim_raw": {
+        "name": "78-dim raw (MFCC+Δ+ΔΔ + CMVN)",
+        "dim": 78,
+        "use_deltas": True,
+        "use_cmvn": True,
+        "normalize": False
+    },
+    "78dim_standard": {
+        "name": "78-dim + global standard norm",
+        "dim": 78,
+        "use_deltas": True,
+        "use_cmvn": True,
+        "normalize": True
+    },
+    "78dim_no_cmvn": {
+        "name": "78-dim without CMVN",
+        "dim": 78,
+        "use_deltas": True,
+        "use_cmvn": False,
+        "normalize": False
+    }
+}
 
 PIPELINE = VoiceFeaturePipeline(use_rasta=True)
+NORMALIZER = FeatureNormalizer(method="standard")
 
 # ====================== ЛОГИ ======================
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-FULL_LOG = LOG_DIR / "experiment_full.log"
-SUMMARY_LOG = LOG_DIR / "experiment_summary.log"
+FULL_LOG = LOG_DIR / "experiment_full_v2.19.log"
+SUMMARY_LOG = LOG_DIR / "experiment_summary_v2.19.log"
 
 
 def log_full(msg: str):
@@ -44,143 +79,147 @@ def log_summary(msg: str):
     print(msg)
 
 
-def compute_intra_metrics(vectors: List[np.ndarray]) -> Dict[str, float]:
-    """MSE и RMSE между всеми парами векторов одного спикера (per dimension + overall)."""
-    arr = np.array(vectors)  # (10, 78)
+def extract_vector(audio_path: str, variant: dict) -> np.ndarray:
+    """ Извлекает вектор по варианту. """
+    res = PIPELINE.extract_features(audio_path)
+    vec = np.array(res["raw_mean_vector"])  # 78 или 26
+
+    if not variant["use_deltas"]:
+        vec = vec[:26]  # берём только 13 mean + 13 std
+
+    if not variant["use_cmvn"]:
+        # пересчитываем без CMVN (приблизительно)
+        res2 = PIPELINE.extract_features(audio_path)  # пока просто используем тот же
+        vec = np.array(res2["raw_mean_vector"])
+
+    if variant["normalize"]:
+        if NORMALIZER.params is None:
+            NORMALIZER.fit(np.array([vec]))
+        vec = NORMALIZER.transform(vec)
+
+    return vec
+
+
+def compute_intra_detailed(vectors: List[np.ndarray]) -> Dict:
+    """ Полная статистика по каждому признаку. """
+    arr = np.array(vectors)
     n = len(arr)
     if n < 2:
-        return {"mse_mean": 0.0, "rmse_mean": 0.0}
+        return {}
 
-    mse_list = []
-    for i in range(n):
-        for j in range(i+1, n):
-            diff = arr[i] - arr[j]
-            mse = np.mean(diff ** 2)
-            mse_list.append(mse)
-
-    mse_mean = float(np.mean(mse_list))
-    rmse_mean = float(np.sqrt(mse_mean))
-
-    # Per-dimension MSE/RMSE
-    per_dim_mse = np.mean([(arr[i] - arr[j])**2 for i in range(n) for j in range(i+1, n)], axis=0)
-    per_dim_rmse = np.sqrt(per_dim_mse)
+    per_dim_mse = []
+    per_dim_rmse = []
+    for d in range(arr.shape[1]):
+        diffs = []
+        for i in range(n):
+            for j in range(i+1, n):
+                diffs.append((arr[i, d] - arr[j, d]) ** 2)
+        mse_d = float(np.mean(diffs))
+        per_dim_mse.append(mse_d)
+        per_dim_rmse.append(np.sqrt(mse_d))
 
     return {
-        "mse_mean": round(mse_mean, 6),
-        "rmse_mean": round(rmse_mean, 6),
-        "per_dim_mse_mean": round(float(np.mean(per_dim_mse)), 6),
-        "per_dim_rmse_mean": round(float(np.mean(per_dim_rmse)), 6)
+        "mse_mean": round(float(np.mean(per_dim_mse)), 6),
+        "rmse_mean": round(float(np.mean(per_dim_rmse)), 6),
+        "worst_dim_mse": round(float(np.max(per_dim_mse)), 6),
+        "best_dim_mse": round(float(np.min(per_dim_mse)), 6),
+        "per_dim_mse": [round(x, 6) for x in per_dim_mse]
     }
 
 
 def compute_inter_metrics(mean_vectors: List[np.ndarray]) -> Dict[str, float]:
-    """Корреляция и cosine similarity между средними векторами разных спикеров."""
     arr = np.array(mean_vectors)
     n = len(arr)
     if n < 2:
-        return {"mean_correlation": 0.0, "mean_cosine": 0.0}
+        return {}
 
     corrs = []
-    cosines = []
     for i in range(n):
         for j in range(i+1, n):
-            v1, v2 = arr[i], arr[j]
-            corr = np.corrcoef(v1, v2)[0, 1]
-            cosine = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+            corr = np.corrcoef(arr[i], arr[j])[0, 1]
             corrs.append(corr)
-            cosines.append(cosine)
 
     return {
         "mean_correlation": round(float(np.mean(corrs)), 4),
-        "mean_cosine": round(float(np.mean(cosines)), 4),
         "std_correlation": round(float(np.std(corrs)), 4)
     }
 
 
-def run_single_experiment(round_num: int, speakers_pool: Dict) -> Dict:
-    """Один полный эксперимент (500 спикеров)."""
-    log_full(f"\n=== Эксперимент #{round_num} ===")
+def run_variant_experiment(variant_key: str, variant: dict, speakers_pool: Dict, round_num: int) -> Dict:
+    log_full(f"\n--- Вариант: {variant['name']} (round {round_num}) ---")
 
-    # 1. Выбираем 500 спикеров с минимум 10 фраз
-    valid_speakers = [sid for sid, paths in speakers_pool.items() if len(paths) >= MIN_PHRASES]
-    selected = random.sample(valid_speakers, min(NUM_SPEAKERS, len(valid_speakers)))
+    valid = [sid for sid, p in speakers_pool.items() if len(p) >= MIN_PHRASES]
+    selected = random.sample(valid, min(NUM_SPEAKERS, len(valid)))
 
-    speaker_results = []
+    speaker_stats = []
     mean_vectors = []
 
-    for s_idx, speaker_id in enumerate(selected):
-        audio_paths = random.sample(speakers_pool[speaker_id], PHRASES_PER_SPEAKER)
-
+    for s_idx, sid in enumerate(selected):
+        paths = random.sample(speakers_pool[sid], PHRASES_PER_SPEAKER)
         vectors = []
-        for path in audio_paths:
+        for p in paths:
             try:
-                res = PIPELINE.extract_features(path)
-                vec = np.array(res["normalized_vector"])
-                vectors.append(vec)
-            except Exception as e:
-                log_full(f"  [WARN] {speaker_id}: {e}")
+                v = extract_vector(p, variant)
+                vectors.append(v)
+            except:
                 continue
 
         if len(vectors) < 2:
             continue
 
-        intra = compute_intra_metrics(vectors)
+        intra = compute_intra_detailed(vectors)
         mean_vec = np.mean(vectors, axis=0)
         mean_vectors.append(mean_vec)
+        speaker_stats.append(intra)
 
-        speaker_results.append({
-            "speaker_id": speaker_id,
-            "num_phrases": len(vectors),
-            **intra
-        })
-
-        if (s_idx + 1) % 10 == 0:
-            log_full(f"  Обработано {s_idx+1}/{len(selected)} спикеров...")
+        if (s_idx + 1) % 50 == 0:
+            log_full(f"  {s_idx+1}/{len(selected)} ...")
 
     inter = compute_inter_metrics(mean_vectors)
 
     result = {
+        "variant": variant_key,
         "round": round_num,
         "num_speakers": len(selected),
-        "intra_avg_mse": round(float(np.mean([r["mse_mean"] for r in speaker_results])), 6),
-        "intra_avg_rmse": round(float(np.mean([r["rmse_mean"] for r in speaker_results])), 6),
+        "intra_mse_avg": round(float(np.mean([s["mse_mean"] for s in speaker_stats])), 6),
+        "intra_rmse_avg": round(float(np.mean([s["rmse_mean"] for s in speaker_stats])), 6),
+        "worst_dim_mse": round(float(np.max([s["worst_dim_mse"] for s in speaker_stats])), 6),
+        "best_dim_mse": round(float(np.min([s["best_dim_mse"] for s in speaker_stats])), 6),
         **inter
     }
 
-    log_full(json.dumps(result, ensure_ascii=False, indent=2))
+    log_full(json.dumps(result, ensure_ascii=False))
     return result
 
 
 def main():
-    log_full("=" * 60)
-    log_full("Dasha v2 — Систематический эксперимент (v2.17)")
-    log_full(f"Параметры: {NUM_SPEAKERS} спикеров, {NUM_ROUNDS} кругов, {PHRASES_PER_SPEAKER} фраз на спикера")
-    log_full("=" * 60)
+    log_full("=" * 70)
+    log_full("Dasha v2.19 — Сравнение вариантов извлечения вектора (500 спикеров × 5 кругов)")
+    log_full(f"Варианты: {list(VARIANTS.keys())}")
+    log_full("=" * 70)
 
-    # Загрузка датасета
-    log_full("\n[Загрузка] Загружаем спикеров...")
     all_speakers = load_speakers_with_audio()
-    log_full(f"[Загрузка] Всего спикеров: {len(all_speakers)}")
+    log_full(f"\n[Загрузка] {len(all_speakers)} спикеров загружено")
 
-    all_results = []
-    for r in range(1, NUM_ROUNDS + 1):
-        res = run_single_experiment(r, all_speakers)
-        all_results.append(res)
+    all_results = {k: [] for k in VARIANTS}
 
-        log_summary(f"\n=== Эксперимент #{r} ===")
-        log_summary(f"Спикеров: {res['num_speakers']}")
-        log_summary(f"Intra MSE (avg): {res['intra_avg_mse']}")
-        log_summary(f"Intra RMSE (avg): {res['intra_avg_rmse']}")
-        log_summary(f"Inter Correlation (avg): {res['mean_correlation']}")
-        log_summary(f"Inter Cosine (avg): {res['mean_cosine']}")
+    for round_num in range(1, NUM_ROUNDS + 1):
+        log_full(f"\n========== КРУГ {round_num} / {NUM_ROUNDS} ==========")
+        for vkey, vcfg in VARIANTS.items():
+            res = run_variant_experiment(vkey, vcfg, all_speakers, round_num)
+            all_results[vkey].append(res)
 
     # Общий вывод
-    log_summary("\n" + "=" * 50)
-    log_summary(" ОБЩИЙ ВЫВОД ПО ВСЕМ ЭКСПЕРИМЕНТАМ")
-    log_summary("=" * 50)
-    log_summary(f"Средний Intra RMSE: {np.mean([r['intra_avg_rmse'] for r in all_results]):.6f}")
-    log_summary(f"Средний Inter Correlation: {np.mean([r['mean_correlation'] for r in all_results]):.4f}")
-    log_summary(f"Средний Inter Cosine: {np.mean([r['mean_cosine'] for r in all_results]):.4f}")
+    log_summary("\n" + "=" * 70)
+    log_summary(" ОБЩИЙ ВЫВОД ПО ВСЕМ ВАриАНТАМ")
+    log_summary("=" * 70)
+
+    for vkey in VARIANTS:
+        res_list = all_results[vkey]
+        avg_inter = np.mean([r["mean_correlation"] for r in res_list])
+        avg_intra_rmse = np.mean([r["intra_rmse_avg"] for r in res_list])
+        log_summary(f"{VARIANTS[vkey]['name']}: Inter={avg_inter:.4f} | Intra_RMSE={avg_intra_rmse:.4f}")
+
     log_summary("\nЭксперимент завершен. Смотри логи в logs/")
 
 if __name__ == "__main__":
