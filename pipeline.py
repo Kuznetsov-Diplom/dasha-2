@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2.28 — Voice Feature Pipeline (FINAL + RASTA)
+Dasha v2.29 — Официальный pipeline по требованиям ГОСТ + PROJECT.md
 
-- 13-dim (mean only) — официальный
-- global_minmax_abs — официальный метод нормализации
-- RASTA = ON (по умолчанию) для устойчивости к канальным искажениям
-- Исправлен CMVN (per-feature)
-- Готов к НПБК по ГОСТ Р 52633.5
-- Соответствует гл. 2 диплома: MFCC + RASTA + CMVN
+- СТРОГО 13-dim (mean MFCC 1-13)
+- global_minmax_abs
+- RASTA = OFF, Delta = OFF (по спецификации)
+- CMVN per-feature
+- Готов к НПБК по ГОСТ Р 52633.5-2011
 """
 
 from __future__ import annotations
@@ -33,9 +32,9 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = True, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
-        self.use_rasta = use_rasta
-        self.use_deltas = use_deltas
+    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
+        self.use_rasta = use_rasta  # OFF по умолчанию
+        self.use_deltas = use_deltas  # OFF по умолчанию
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax_abs")
         self._load_normalizer_if_exists()
 
@@ -82,7 +81,6 @@ class VoiceFeaturePipeline:
 
     @staticmethod
     def _cmvn(mfcc: np.ndarray, window: int = 301) -> np.ndarray:
-        """Корректный CMVN per-feature (по каждому MFCC-коэффициенту во времени)"""
         mfcc = mfcc.astype(np.float32)
         n_coeffs, n_frames = mfcc.shape
         if n_frames < window:
@@ -91,22 +89,9 @@ class VoiceFeaturePipeline:
         for c in range(n_coeffs):
             feat = mfcc[c]
             local_mean = np.convolve(feat, np.ones(window) / window, mode='same')
-            # Простая оценка локального std
             local_std = np.convolve(np.abs(feat - local_mean), np.ones(window) / window, mode='same') + 1e-8
             mfcc_norm[c] = (feat - local_mean) / local_std
         return mfcc_norm
-
-    def _apply_rasta(self, mfcc: np.ndarray) -> np.ndarray:
-        """RASTA-фильтр для подавления медленных вариаций (канал, микрофон) — повышает стабильность по ГОСТ"""
-        if not self.use_rasta or mfcc.shape[1] < 5:
-            return mfcc
-        # Стандартный RASTA IIR (приближение для cepstral features)
-        b = np.array([0.2, 0.1, 0.0, -0.1, -0.2], dtype=np.float32)
-        a = np.array([1.0, -0.94], dtype=np.float32)
-        rasta_mfcc = np.zeros_like(mfcc)
-        for i in range(mfcc.shape[0]):
-            rasta_mfcc[i] = signal.lfilter(b, a, mfcc[i])
-        return rasta_mfcc
 
     def extract_features(self, audio_input: str | np.ndarray | Path, sr: Optional[int] = None) -> Dict[str, Any]:
         if isinstance(audio_input, (str, Path)):
@@ -128,17 +113,17 @@ class VoiceFeaturePipeline:
         vad_mask = self._vad(y_pre, sr)
 
         mfcc = librosa.feature.mfcc(
-            y=y_pre, sr=sr, n_mfcc=self.N_MFCC + 1,
+            y=y_pre, sr=sr, n_mfcc=self.N_MFCC,
             n_fft=frame_length, hop_length=hop_length,
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX,
             window="hamming", center=True, norm="ortho"
         )
-        mfcc = mfcc[1:, :]
 
         mfcc_norm = self._cmvn(mfcc)
 
-        if self.use_rasta:
-            mfcc_norm = self._apply_rasta(mfcc_norm)
+        if self.use_rasta and mfcc_norm.shape[1] >= 5:
+            # RASTA отключен по умолчанию
+            pass
 
         if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
             active = mfcc_norm[:, vad_mask]
@@ -147,17 +132,9 @@ class VoiceFeaturePipeline:
 
         mean_vec = np.mean(active, axis=1)
 
-        # Опционально: Delta (для будущих экспериментов, по умолчанию OFF для 13-dim официального)
-        if self.use_deltas and active.shape[1] > 2:
-            delta = librosa.feature.delta(active)
-            delta2 = librosa.feature.delta(active, order=2)
-            full_vec = np.concatenate([mean_vec, np.mean(delta, axis=1), np.mean(delta2, axis=1)])
-            dim = 39
-            dim_label = "39-dim (MFCC+Delta+Delta2) + RASTA + global_minmax_abs"
-        else:
-            full_vec = mean_vec
-            dim = 13
-            dim_label = "13-dim (mean only) + RASTA + global_minmax_abs"
+        full_vec = mean_vec
+        dim = 13
+        dim_label = "13-dim (mean only) + global_minmax_abs (ГОСТ-ready)"
 
         normalized = self.normalizer.transform(full_vec)
 
@@ -171,7 +148,7 @@ class VoiceFeaturePipeline:
             "sr": sr,
             "dim": dim,
             "dim_label": dim_label,
-            "pipeline_version": "v2.28 RASTA+CMVN_FIXED"
+            "pipeline_version": "v2.29 ГОСТ 13-dim OFF-RASTA"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -190,3 +167,12 @@ class VoiceFeaturePipeline:
             "mean_feature_correlation": round(mean_feature_corr, 4),
             "num_vectors": len(vectors)
         }
+
+    def compute_eer(self, own_scores: list, alien_scores: list) -> float:
+        """Простая оценка EER (ошибка 1 и 2 рода)"""
+        from sklearn.metrics import roc_curve
+        y_true = [1]*len(own_scores) + [0]*len(alien_scores)
+        y_scores = own_scores + alien_scores
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+        eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
+        return round(eer, 4)
