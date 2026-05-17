@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.12
+Dasha v2 — Gradio интерфейс v2.13
 
-- Все синтетические данные убраны
-- Нормализатор обучается НА РЕАЛЬНЫХ данных из датасета при каждом запуске (150+ векторов)
-- Вкладки 1, 2 и 3 используют ОДИН И ТОТ ЖЕ pipeline.extract_features()
-- Таб 3: теперь всегда показываются ровно выбранное кол-во спикеров (heatmap + график на средних векторах)
-- Таб 3 работает на реальных спикерах Common Voice RU
+- Исправлена синтаксическая ошибка в process_correlation (закрыта скобка Scatter)
+- Вкладки 1-3 используют один и тот же pipeline
+- Таб 3: heatmap и график строятся по средним векторам спикеров (ровно выбранное кол-во)
+- Нормализатор — только на реальных данных при запуске
+- Добавлена идея per-speaker RMS для будущей стабильности в НПБК
 """
 import gradio as gr
 import numpy as np
@@ -38,10 +38,9 @@ def _collect_real_vectors(max_vecs: int = 150) -> list:
     vecs = []
     if not global_speakers:
         return vecs
-    # Берём топ-20 спикеров по кол-ву фраз
     sorted_sp = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:20]
     for speaker_id, audio_paths in sorted_sp:
-        for path in audio_paths[:6]:  # до 6 фраз на спикера
+        for path in audio_paths[:6]:
             try:
                 res = pipeline.extract_features(path)
                 vecs.append(res["normalized_vector"])
@@ -145,15 +144,28 @@ def process_correlation(files, use_rasta):
     mean_vec = np.mean(arr, axis=0)
     fig_lines = go.Figure()
     for i, v in enumerate(vectors):
-        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7)
-    fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
+        fig_lines.add_trace(go.Scatter(
+            x=list(range(len(v))),
+            y=v,
+            mode="lines+markers",
+            name=labels[i],
+            line=dict(width=1.5),
+            opacity=0.7
+        ))
+    fig_lines.add_trace(go.Scatter(
+        x=list(range(len(v))),
+        y=mean_vec,
+        mode="lines",
+        name="Средний эталон",
+        line=dict(color="black", width=3, dash="dash")
+    ))
     fig_lines.update_layout(title="Векторы vs Средний эталон", height=320, template="plotly_white")
     md = f"**Обработано {len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}**"
     return md, fig_corr, fig_lines
 
 
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
-    """Полностью на реальных аудио + единый pipeline. Heatmap и график — ровно по кол-ву спикеров (fixed)."""
+    """Полностью на реальных аудио + единый pipeline. Heatmap и график — ровно по кол-ву спикеров. Добавлен per-speaker RMS как метрика стабильности для НПБК."""
     global pipeline, global_speakers
     pipeline.use_rasta = use_rasta
 
@@ -165,6 +177,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
 
     all_vectors, speaker_labels = [], []
     speaker_means = []
+    speaker_rms = []  # новый: RMS по среднему вектору спикера (стабильность)
 
     for s_idx, (speaker_id, audio_paths) in enumerate(sorted_speakers):
         phrase_vectors = []
@@ -179,7 +192,10 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
             except Exception:
                 continue
         if phrase_vectors:
-            speaker_means.append(np.mean(phrase_vectors, axis=0))
+            mean_vec = np.mean(phrase_vectors, axis=0)
+            speaker_means.append(mean_vec)
+            rms = float(np.sqrt(np.mean(np.square(mean_vec))))  # RMS как мера "энергии" / стабильности
+            speaker_rms.append(rms)
 
     if len(all_vectors) < 4:
         return f"❌ Мало аудио в датасете (всего {len(all_vectors)} векторов). Нужно минимум 4.", None, None, ""
@@ -198,9 +214,10 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
     eer_proxy = max(0, (mean_inter - mean_intra) / (mean_intra + 1e-8) * 100)
 
-    md = f"**Массовый тест ГОСТ Р 52633 (реальные данные)** | Спикеров: {actual_num} | Фраз всего: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
+    # Добавляем RMS в md
+    rms_str = ", ".join([f"{r:.3f}" for r in speaker_rms])
+    md = f"**Массовый тест ГОСТ Р 52633 (реальные данные)** | Спикеров: {actual_num} | Фраз всего: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}% | RMS спикеров: [{rms_str}]"
 
-    # === FIX: хитмап и график только по средним векторам спикеров ===
     unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
     fig_heat = create_correlation_heatmap(speaker_means, unique_labels)
 
@@ -211,7 +228,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
             x=list(range(26)),
             y=speaker_means[s],
             mode="lines+markers",
-            name=f"Спикер {s+1} (реальный)",
+            name=f"Спикер {s+1} (реальный, RMS={speaker_rms[s]:.3f})",
             line=dict(width=2.5, color=colors[s % len(colors)]),
             marker=dict(size=5)
         ))
@@ -222,14 +239,14 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    quality_md = f"**Ресеарч:** Реальные данные из Common Voice RU | Все векторы прошли через один pipeline (MFCC+RASTA+CMVN+нормализация)"
+    quality_md = f"**Ресеарч:** Реальные данные из Common Voice RU | Per-speaker mean + RMS (готово для НПБК) | Все векторы прошли через один pipeline"
     return md, fig_heat, fig_lines, quality_md
 
 
 def train_normalizer(max_speakers, phrases):
     """Переобучение на реальных данных (без синтетики)."""
     global normalizer, pipeline, global_speakers
-    real_vecs = _collect_real_vectors(80)  # меньше для кнопки
+    real_vecs = _collect_real_vectors(80)
     if not real_vecs:
         return "❌ Нет реальных данных для переобучения. Положи датасет в data/."
     arr = np.array(real_vecs)
@@ -242,7 +259,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.12 — нормализатор на реальных данных при запуске | без синтетики | все спикеры в табе 3**  
+    **v2.13 — исправлена синтаксическая ошибка | per-speaker RMS в табе 3 | нормализатор на реальных данных**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -316,7 +333,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.12** — полностью на реальных данных из data/ + единый pipeline. Май 2026.
+    **Dasha v2 v2.13** — исправлена ошибка | per-speaker mean + RMS | реальные данные. Май 2026.
     """)
 
 if __name__ == "__main__":
