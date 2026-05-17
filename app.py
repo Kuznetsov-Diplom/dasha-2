@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.10
-Таб 3: теперь в графике показывается ровно столько спикеров, сколько выбрано,
-и отображается средний вектор по спикеру (а не отдельные фразы).
+Dasha v2 — Gradio интерфейс v2.11
+
+- cv_ru_loader теперь строго только реальные данные из data/ (без синтетики)
+- Вкладки 1, 2 и 3 используют ОДИН И ТОТ ЖЕ pipeline.extract_features() для всех аудио
+- Таб 3 теперь работает на реальных спикерах и аудио из датасета Common Voice RU
 """
 import gradio as gr
 import numpy as np
@@ -14,18 +16,19 @@ import soundfile as sf
 
 from pipeline import VoiceFeaturePipeline
 from normalizer import FeatureNormalizer
-from cv_ru_loader import load_speakers_and_phrases
+from cv_ru_loader import load_speakers_with_audio
 
 pipeline = VoiceFeaturePipeline(use_rasta=True)
 normalizer = FeatureNormalizer(method="global_minmax")
 
-print("🔄 Проверка нормализатора и спикеров...")
+print("\ud83d\udd04 Проверка нормализатора и датасета...")
+global_speakers = {}
 try:
-    speakers = load_speakers_and_phrases()
-    print(f"✅ Загружено {len(speakers)} спикеров")
+    global_speakers = load_speakers_with_audio()
+    print(f"✅ Загружено {len(global_speakers)} реальных спикеров из data/")
 except Exception as e:
     print(f"⚠️  {e}")
-    speakers = {}
+    global_speakers = {}
 
 
 def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go.Figure:
@@ -39,7 +42,7 @@ def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go
 def create_vector_bar_plot(vector: list, title: str = "26-мерный вектор (13 mean + 13 std после RASTA)") -> go.Figure:
     fig = go.Figure()
     colors = ["#FF6B6B" if v > 0.7 else "#4ECDC4" for v in vector]
-    fig.add_trace(go.Bar(x=[f"F{i+1}" for i in range(len(vector))], y=vector, marker_color=colors, text=[f"{v:.2f}" for v in vector], textposition="outside", textfont=dict(size=9)))
+    fig.add_trace(go.Bar(x=[f"F{i+1}" for i in range(len(vector))], y=vector, marker_color=colors, text=[f"{v:.2f}" for v in vector], textposition="outside", textfont=dict(size=9))
     fig.update_layout(title=title, yaxis=dict(range=[0, 1.05]), height=320, margin=dict(l=30, r=20, t=40, b=50), template="plotly_white", showlegend=False)
     return fig
 
@@ -112,29 +115,39 @@ def process_correlation(files, use_rasta):
 
 
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
-    np.random.seed(42)
+    """Теперь полностью на реальных аудио из датасета — через тот же pipeline, что и вкладки 1 и 2."""
+    global pipeline, global_speakers
+    pipeline.use_rasta = use_rasta
+
+    if not global_speakers:
+        return "❌ Датасет не загружен. Положи Common Voice RU в data/firefox-ru-dataset/ (validated.tsv + clips/).", None, None, ""
+
+    # Берём самых "богатых" спикеров
+    sorted_speakers = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:num_speakers]
+    actual_num = len(sorted_speakers)
+
     all_vectors, speaker_labels = [], []
-    speaker_means = []   # средние векторы по спикерам
+    speaker_means = []
 
-    # === Реалистичные данные для ГОСТ ===
-    speaker_bases = []
-    for s in range(num_speakers):
-        base = np.random.uniform(0.15, 0.85, 26)
-        speaker_bases.append(base)
-
-    for s in range(num_speakers):
-        base = speaker_bases[s]
+    for s_idx, (speaker_id, audio_paths) in enumerate(sorted_speakers):
         phrase_vectors = []
-        for _ in range(phrases_per_speaker):
-            noise = np.random.normal(0, 0.04, 26)
-            vec = np.clip(base + noise, 0, 1)
-            all_vectors.append(vec)
-            speaker_labels.append(f"Спикер {s+1}")
-            phrase_vectors.append(vec)
+        selected = audio_paths[:phrases_per_speaker]
+        for path in selected:
+            try:
+                res = pipeline.extract_features(path)  # ← ТОЧНО ТАК ЖЕ, как в вкладках 1 и 2
+                vec = res["normalized_vector"]
+                all_vectors.append(vec)
+                speaker_labels.append(f"Спикер {s_idx+1}")
+                phrase_vectors.append(vec)
+            except Exception:
+                continue
+        if phrase_vectors:
+            speaker_means.append(np.mean(phrase_vectors, axis=0))
 
-        # Средний вектор спикера
-        speaker_means.append(np.mean(phrase_vectors, axis=0))
+    if len(all_vectors) < 4:
+        return f"❌ Мало аудио в датасете (всего {len(all_vectors)} векторов). Нужно минимум 4.", None, None, ""
 
+    # Метрики ГОСТ
     intra_sims, inter_sims = [], []
     arr = np.array(all_vectors)
     for i in range(len(arr)):
@@ -149,32 +162,30 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
     eer_proxy = max(0, (mean_inter - mean_intra) / (mean_intra + 1e-8) * 100)
 
-    md = f"**Массовый тест по ГОСТ Р 52633** | Спикеров: {num_speakers} | Фраз: {phrases_per_speaker} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
+    md = f"**Массовый тест ГОСТ Р 52633 (реальные данные)** | Спикеров: {actual_num} | Фраз всего: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
 
-    # Хитмап — показываем все векторы (но не больше 30, чтобы не было слишком тесно)
     max_for_heat = min(30, len(all_vectors))
     fig_heat = create_correlation_heatmap(all_vectors[:max_for_heat], speaker_labels[:max_for_heat])
 
-    # === НОВОЕ: один средний вектор на спикера ===
     fig_lines = go.Figure()
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
-    for s in range(num_speakers):
+    for s in range(len(speaker_means)):
         fig_lines.add_trace(go.Scatter(
             x=list(range(26)),
             y=speaker_means[s],
             mode="lines+markers",
-            name=f"Спикер {s+1} (средний)",
+            name=f"Спикер {s+1} (реальный)",
             line=dict(width=2.5, color=colors[s % len(colors)]),
             marker=dict(size=5)
         ))
     fig_lines.update_layout(
-        title=f"Средние векторы спикеров ({num_speakers} спикеров)",
+        title=f"Средние векторы реальных спикеров ({len(speaker_means)} спикеров из датасета)",
         height=320,
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    quality_md = f"**Ресеарч:** Реалистичные кластеры + средние векторы по спикерам. mean+std даёт хорошую разделимость при сохранении высокой стабильности."
+    quality_md = f"**Ресеарч:** Реальные данные из Common Voice RU | Все векторы прошли через один pipeline (MFCC+RASTA+нормализация)"
     return md, fig_heat, fig_lines, quality_md
 
 
@@ -191,7 +202,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.10 — таб 3 теперь показывает ровно столько спикеров, сколько выбрано, и средние векторы по спикеру.**  
+    **v2.11 — теперь всё строго на реальном датасете из data/ + единый pipeline во всех вкладках**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -229,7 +240,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("3. Массовый тест + Research"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Параметры теста (реалистичные кластеры спикеров)")
+                    gr.Markdown("### Параметры теста (реальные спикеры из датасета data/)")
                     num_sp = gr.Slider(2, 12, value=5, step=1, label="Количество спикеров")
                     ph_per = gr.Slider(3, 15, value=8, step=1, label="Фраз на спикера")
                     use_rasta3 = gr.Checkbox(value=True, label="RASTA")
@@ -264,7 +275,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.10** — массовый тест стал нагляднее и честнее. Май 2026.
+    **Dasha v2 v2.11** — полностью перешёл на реальные данные из data/ + единый pipeline. Май 2026.
     """)
 
 if __name__ == "__main__":
