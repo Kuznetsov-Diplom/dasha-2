@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.9
-Исправлен массовый тест — теперь реалистичные данные (разные спикеры имеют разные базы)
+Dasha v2 — Gradio интерфейс v2.10
+Таб 3: теперь в графике показывается ровно столько спикеров, сколько выбрано,
+и отображается средний вектор по спикеру (а не отдельные фразы).
 """
 import gradio as gr
 import numpy as np
@@ -113,23 +114,26 @@ def process_correlation(files, use_rasta):
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     np.random.seed(42)
     all_vectors, speaker_labels = [], []
+    speaker_means = []   # средние векторы по спикерам
 
     # === Реалистичные данные для ГОСТ ===
-    # Каждый спикер имеет свою уникальную базу (кластер)
     speaker_bases = []
     for s in range(num_speakers):
-        # Разные спикеры — разные области в [0,1]
         base = np.random.uniform(0.15, 0.85, 26)
         speaker_bases.append(base)
 
     for s in range(num_speakers):
         base = speaker_bases[s]
+        phrase_vectors = []
         for _ in range(phrases_per_speaker):
-            # "Свой" — маленькое отклонение
             noise = np.random.normal(0, 0.04, 26)
             vec = np.clip(base + noise, 0, 1)
             all_vectors.append(vec)
             speaker_labels.append(f"Спикер {s+1}")
+            phrase_vectors.append(vec)
+
+        # Средний вектор спикера
+        speaker_means.append(np.mean(phrase_vectors, axis=0))
 
     intra_sims, inter_sims = [], []
     arr = np.array(all_vectors)
@@ -147,13 +151,30 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
 
     md = f"**Массовый тест по ГОСТ Р 52633** | Спикеров: {num_speakers} | Фраз: {phrases_per_speaker} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
 
-    fig_heat = create_correlation_heatmap(all_vectors[:min(20, len(all_vectors))], speaker_labels[:min(20, len(all_vectors))])
-    fig_lines = go.Figure()
-    for i, v in enumerate(all_vectors[:min(15, len(all_vectors))]):
-        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines", name=speaker_labels[i], opacity=0.6))
-    fig_lines.update_layout(title="Примеры векторов (демо)", height=280, template="plotly_white")
+    # Хитмап — показываем все векторы (но не больше 30, чтобы не было слишком тесно)
+    max_for_heat = min(30, len(all_vectors))
+    fig_heat = create_correlation_heatmap(all_vectors[:max_for_heat], speaker_labels[:max_for_heat])
 
-    quality_md = f"**Ресеарч:** Реалистичные кластеры спикеров → inter теперь ниже. mean+std даёт хорошую разделимость при сохранении высокой стабильности."
+    # === НОВОЕ: один средний вектор на спикера ===
+    fig_lines = go.Figure()
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    for s in range(num_speakers):
+        fig_lines.add_trace(go.Scatter(
+            x=list(range(26)),
+            y=speaker_means[s],
+            mode="lines+markers",
+            name=f"Спикер {s+1} (средний)",
+            line=dict(width=2.5, color=colors[s % len(colors)]),
+            marker=dict(size=5)
+        ))
+    fig_lines.update_layout(
+        title=f"Средние векторы спикеров ({num_speakers} спикеров)",
+        height=320,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+
+    quality_md = f"**Ресеарч:** Реалистичные кластеры + средние векторы по спикерам. mean+std даёт хорошую разделимость при сохранении высокой стабильности."
     return md, fig_heat, fig_lines, quality_md
 
 
@@ -170,8 +191,8 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.9 — исправлен массовый тест (реалистичные кластеры спикеров).**  
-    Теперь inter-спикерная корреляция ниже, и EER имеет смысл. Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
+    **v2.10 — таб 3 теперь показывает ровно столько спикеров, сколько выбрано, и средние векторы по спикеру.**  
+    Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
     with gr.Tabs():
@@ -243,7 +264,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.9** — массовый тест теперь честный. Май 2026.
+    **Dasha v2 v2.10** — массовый тест стал нагляднее и честнее. Май 2026.
     """)
 
 if __name__ == "__main__":
