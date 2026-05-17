@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.26
+Dasha v2.27 — Voice Feature Pipeline (FINAL)
 
-- 13-dim (mean MFCC only) — официальный вектор
-- 26-dim (mean + std) — experimental
+- 13-dim (mean only) — официальный
+- global_minmax_abs — официальный метод нормализации
 - RASTA = OFF
-- per-utterance CMVN
-- Готов к НПБК
+- Готов к НПБК по ГОСТ Р 52633.5
 """
 
 from __future__ import annotations
 import numpy as np
 import librosa
-import soundfile as sf
-from scipy.signal import lfilter
 from typing import Dict, Any, Optional
 from pathlib import Path
 import json
@@ -33,12 +30,10 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, use_std: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.use_deltas = use_deltas
-        self.use_std = use_std          # False = 13-dim (mean only), True = 26-dim
-        self.vad_threshold = vad_threshold
-        self.normalizer = normalizer or FeatureNormalizer(method="standard")
+        self.normalizer = normalizer or FeatureNormalizer(method="global_minmax_abs")
         self._load_normalizer_if_exists()
 
     def _load_normalizer_if_exists(self) -> None:
@@ -48,7 +43,7 @@ class VoiceFeaturePipeline:
                 with open(params_path, "r", encoding="utf-8") as f:
                     params = json.load(f)
                 self.normalizer.params = params
-                self.normalizer.method = params.get("method", "standard")
+                self.normalizer.method = params.get("method", "global_minmax_abs")
             except Exception as e:
                 print(f"[Pipeline] Не удалось загрузить нормализатор: {e}")
 
@@ -60,7 +55,7 @@ class VoiceFeaturePipeline:
         frame_length = int(self.FRAME_LENGTH_MS * sr / 1000)
         hop_length = int(self.FRAME_SHIFT_MS * sr / 1000)
         rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length, center=True)[0]
-        threshold = max(self.vad_threshold, np.percentile(rms, self.VAD_ENERGY_PERCENTILE))
+        threshold = max(0.01, np.percentile(rms, self.VAD_ENERGY_PERCENTILE))
         speech_mask = rms > threshold
 
         min_frames = int(self.MIN_SPEECH_SEC * sr / hop_length)
@@ -126,30 +121,19 @@ class VoiceFeaturePipeline:
             active = mfcc_norm
 
         mean_vec = np.mean(active, axis=1)
-
-        if self.use_std:
-            std_vec = np.std(active, axis=1) + 1e-8
-            features = np.concatenate([mean_vec, std_vec])
-            dim_label = "26-dim (mean + std, experimental)"
-        else:
-            features = mean_vec
-            dim_label = "13-dim (mean only)"
-
-        normalized = features.astype(np.float32)
+        normalized = self.normalizer.transform(mean_vec)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": features,
+            "raw_mean_vector": mean_vec.tolist(),
             "mfcc_rasta": mfcc_norm,
-            "features": features,
+            "features": mean_vec,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
-            "use_deltas": self.use_deltas,
-            "use_std": self.use_std,
-            "dim": len(features),
-            "dim_label": dim_label,
-            "pipeline_version": "2.26 (13-dim mean only default)"
+            "dim": 13,
+            "dim_label": "13-dim (mean only) + global_minmax_abs",
+            "pipeline_version": "v2.27 FINAL"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -163,16 +147,8 @@ class VoiceFeaturePipeline:
         mean_cosine = float(np.mean(sims))
         corr_matrix = np.corrcoef(arr.T)
         mean_feature_corr = float(np.mean(np.abs(corr_matrix[np.triu_indices_from(corr_matrix, 1)])))
-        feature_vars = np.var(arr, axis=0)
-        entropy_proxy = float(np.mean(feature_vars))
         return {
             "mean_cosine_similarity": round(mean_cosine, 4),
             "mean_feature_correlation": round(mean_feature_corr, 4),
-            "feature_variance_proxy": round(entropy_proxy, 4),
             "num_vectors": len(vectors)
         }
-
-
-def process_phrase(audio_path: str | Path, use_deltas: bool = False, use_std: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
-    pipeline = VoiceFeaturePipeline(use_deltas=use_deltas, use_std=use_std, normalizer=normalizer)
-    return pipeline.extract_features(audio_path)
