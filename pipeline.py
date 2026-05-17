@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.17 (RAW без глобальной нормализации)
+Dasha v2 — Voice Feature Pipeline v2.20 (26-мерный — победитель эксперимента)
 
-- 13 MFCC + 13 Δ + 13 ΔΔ = 39 коэффициентов
-- mean + std = 78-мерный вектор
-- + per-utterance CMVN + RASTA
-- **Без глобальной нормализации** (raw features)
-- Эксперимент: посмотреть реальную разделимость без global norm
+- 13 MFCC (mean + std) = 26-мерный вектор
+- Без дельт — показал лучшую разделимость (inter ~0.25)
+- + RASTA + per-utterance CMVN
+- Глобальная нормализация: standard
 """
 
 from __future__ import annotations
@@ -132,34 +131,34 @@ class VoiceFeaturePipeline:
 
         mfcc_norm = self._cmvn(mfcc_rasta)
 
-        delta = librosa.feature.delta(mfcc_norm, width=9, mode='interp')
-        delta2 = librosa.feature.delta(mfcc_norm, order=2, width=9, mode='interp')
-
-        features_39 = np.vstack([mfcc_norm, delta, delta2])
-
-        if np.any(vad_mask) and vad_mask.shape[0] == features_39.shape[1]:
-            active = features_39[:, vad_mask]
+        if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
+            active = mfcc_norm[:, vad_mask]
         else:
-            active = features_39
+            active = mfcc_norm
 
         mean_vec = np.mean(active, axis=1)
         std_vec  = np.std(active, axis=1) + 1e-8
-        features_78 = np.concatenate([mean_vec, std_vec])
+        features_26 = np.concatenate([mean_vec, std_vec])
 
-        # === БЕЗ ГЛОБАЛЬНОЙ НОРМАЛИЗАЦИИ (raw) ===
-        # normalized = self.normalizer.transform(features_78)   # отключено
-        normalized = features_78.astype(np.float32)   # сырой вектор
+        if self.normalizer.params is not None:
+            normalized = self.normalizer.transform(features_26)
+        else:
+            q_low, q_high = np.percentile(features_26, [5, 95])
+            if q_high - q_low < 1e-8:
+                normalized = np.full(26, 0.5, dtype=np.float32)
+            else:
+                normalized = np.clip((features_26 - q_low) / (q_high - q_low), 0.0, 1.0)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": features_78,
+            "raw_mean_vector": features_26,
             "mfcc_rasta": mfcc_rasta,
-            "features_78": features_78,
+            "features_26": features_26,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.17 (RAW 78-dim, no global norm)"
+            "pipeline_version": "2.20 (26-dim winner)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
