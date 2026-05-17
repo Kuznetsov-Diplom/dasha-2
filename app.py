@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.11
+Dasha v2 — Gradio интерфейс v2.12
 
-- cv_ru_loader теперь строго только реальные данные из data/ (без синтетики)
-- Вкладки 1, 2 и 3 используют ОДИН И ТОТ ЖЕ pipeline.extract_features() для всех аудио
-- Таб 3 теперь работает на реальных спикерах и аудио из датасета Common Voice RU
+- Все синтетические данные убраны
+- Нормализатор обучается НА РЕАЛЬНЫХ данных из датасета при каждом запуске (150+ векторов)
+- Вкладки 1, 2 и 3 используют ОДИН И ТОТ ЖЕ pipeline.extract_features()
+- Таб 3: теперь всегда показываются ровно выбранное кол-во спикеров (heatmap + график на средних векторах)
+- Таб 3 работает на реальных спикерах Common Voice RU
 """
 import gradio as gr
 import numpy as np
@@ -29,6 +31,35 @@ try:
 except Exception as e:
     print(f"⚠️  {e}")
     global_speakers = {}
+
+# === Обучение нормализатора НА РЕАЛЬНЫХ данных при запуске ===
+def _collect_real_vectors(max_vecs: int = 150) -> list:
+    """Собирает реальные 26-мерные векторы из global_speakers (без синтетики)."""
+    vecs = []
+    if not global_speakers:
+        return vecs
+    # Берём топ-20 спикеров по кол-ву фраз
+    sorted_sp = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:20]
+    for speaker_id, audio_paths in sorted_sp:
+        for path in audio_paths[:6]:  # до 6 фраз на спикера
+            try:
+                res = pipeline.extract_features(path)
+                vecs.append(res["normalized_vector"])
+                if len(vecs) >= max_vecs:
+                    return vecs
+            except Exception:
+                continue
+    return vecs
+
+real_vecs = _collect_real_vectors(150)
+if real_vecs:
+    arr = np.array(real_vecs)
+    normalizer.fit(arr)
+    normalizer.save()
+    pipeline.normalizer = normalizer
+    print(f"✅ Нормализатор обучен на {len(real_vecs)} РЕАЛЬНЫХ векторах из Common Voice RU")
+else:
+    print("⚠️ Нет реальных данных для обучения нормализатора (положи датасет в data/) ")
 
 
 def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go.Figure:
@@ -114,7 +145,7 @@ def process_correlation(files, use_rasta):
     mean_vec = np.mean(arr, axis=0)
     fig_lines = go.Figure()
     for i, v in enumerate(vectors):
-        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7))
+        fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7)
     fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
     fig_lines.update_layout(title="Векторы vs Средний эталон", height=320, template="plotly_white")
     md = f"**Обработано {len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}**"
@@ -122,14 +153,13 @@ def process_correlation(files, use_rasta):
 
 
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
-    """Теперь полностью на реальных аудио из датасета — через тот же pipeline, что и вкладках 1 и 2."""
+    """Полностью на реальных аудио + единый pipeline. Heatmap и график — ровно по кол-ву спикеров (fixed)."""
     global pipeline, global_speakers
     pipeline.use_rasta = use_rasta
 
     if not global_speakers:
         return "❌ Датасет не загружен. Положи Common Voice RU в data/firefox-ru-dataset/ (validated.tsv + clips/).", None, None, ""
 
-    # Берём самых "богатых" спикеров
     sorted_speakers = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:num_speakers]
     actual_num = len(sorted_speakers)
 
@@ -141,7 +171,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
         selected = audio_paths[:phrases_per_speaker]
         for path in selected:
             try:
-                res = pipeline.extract_features(path)  # ← ТОЧНО ТАК ЖЕ, как в вкладках 1 и 2
+                res = pipeline.extract_features(path)
                 vec = res["normalized_vector"]
                 all_vectors.append(vec)
                 speaker_labels.append(f"Спикер {s_idx+1}")
@@ -154,7 +184,6 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     if len(all_vectors) < 4:
         return f"❌ Мало аудио в датасете (всего {len(all_vectors)} векторов). Нужно минимум 4.", None, None, ""
 
-    # Метрики ГОСТ
     intra_sims, inter_sims = [], []
     arr = np.array(all_vectors)
     for i in range(len(arr)):
@@ -171,8 +200,9 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
 
     md = f"**Массовый тест ГОСТ Р 52633 (реальные данные)** | Спикеров: {actual_num} | Фраз всего: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | EER~{eer_proxy:.1f}%"
 
-    max_for_heat = min(30, len(all_vectors))
-    fig_heat = create_correlation_heatmap(all_vectors[:max_for_heat], speaker_labels[:max_for_heat])
+    # === FIX: хитмап и график только по средним векторам спикеров ===
+    unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
+    fig_heat = create_correlation_heatmap(speaker_means, unique_labels)
 
     fig_lines = go.Figure()
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
@@ -192,24 +222,27 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    quality_md = f"**Ресеарч:** Реальные данные из Common Voice RU | Все векторы прошли через один pipeline (MFCC+RASTA+нормализация)"
+    quality_md = f"**Ресеарч:** Реальные данные из Common Voice RU | Все векторы прошли через один pipeline (MFCC+RASTA+CMVN+нормализация)"
     return md, fig_heat, fig_lines, quality_md
 
 
 def train_normalizer(max_speakers, phrases):
-    global normalizer, pipeline
-    np.random.seed(123)
-    fake_vectors = np.random.beta(2, 2, size=(max_speakers * phrases, 26))
-    normalizer.fit(fake_vectors)
+    """Переобучение на реальных данных (без синтетики)."""
+    global normalizer, pipeline, global_speakers
+    real_vecs = _collect_real_vectors(80)  # меньше для кнопки
+    if not real_vecs:
+        return "❌ Нет реальных данных для переобучения. Положи датасет в data/."
+    arr = np.array(real_vecs)
+    normalizer.fit(arr)
     normalizer.save()
     pipeline.normalizer = normalizer
-    return f"✅ Нормализатор обучен на {len(fake_vectors)} синтетических векторах. Параметры сохранены."
+    return f"✅ Нормализатор переобучен на {len(real_vecs)} РЕАЛЬНЫХ векторах из датасета. Параметры сохранены."
 
 
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.11 — теперь всё строго на реальном датасете из data/ + единый pipeline во всех вкладках**  
+    **v2.12 — нормализатор на реальных данных при запуске | без синтетики | все спикеры в табе 3**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -233,7 +266,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("2. Корреляция и стабильность"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Загрузите любое количество записей одного спикера")
+                    gr.Markdown("### Загрузите любое кол-во записей одного спикера")
                     files_in = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Аудиофайлы")
                     use_rasta2 = gr.Checkbox(value=True, label="RASTA")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
@@ -264,12 +297,13 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
             with gr.Row():
                 with gr.Column():
                     gr.Markdown("""
-                    ### Глобальный нормализатор
-                    Обучите на большой выборке. После обучения все векторы будут в едином масштабе.
+                    ### Глобальный нормализатор (только реальные данные)
+                    Обучается при запуске на 150+ векторах из Common Voice RU.
+                    Кнопка — переобучить на новой выборке.
                     """)
                     max_sp = gr.Slider(10, 200, value=80, step=10, label="Макс. спикеров (демо)")
                     ph = gr.Slider(3, 12, value=6, step=1, label="Фраз на спикера")
-                    btn_train = gr.Button("Обучить и сохранить нормализатора", variant="secondary")
+                    btn_train = gr.Button("Переобучить на реальных данных", variant="secondary")
                     train_out = gr.Markdown()
             btn_train.click(train_normalizer, inputs=[max_sp, ph], outputs=train_out)
 
@@ -282,7 +316,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.11** — полностью перешёл на реальные данные из data/ + единый pipeline. Май 2026.
+    **Dasha v2 v2.12** — полностью на реальных данных из data/ + единый pipeline. Май 2026.
     """)
 
 if __name__ == "__main__":
