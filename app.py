@@ -21,7 +21,7 @@ from cv_ru_loader import load_speakers_with_audio
 pipeline = VoiceFeaturePipeline(use_rasta=True)
 normalizer = FeatureNormalizer(method="global_minmax")
 
-print("\ud83d\udd04 Проверка нормализатора и датасета...")
+print("🔄 Проверка нормализатора и датасета...")
 global_speakers = {}
 try:
     global_speakers = load_speakers_with_audio()
@@ -42,7 +42,14 @@ def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go
 def create_vector_bar_plot(vector: list, title: str = "26-мерный вектор (13 mean + 13 std после RASTA)") -> go.Figure:
     fig = go.Figure()
     colors = ["#FF6B6B" if v > 0.7 else "#4ECDC4" for v in vector]
-    fig.add_trace(go.Bar(x=[f"F{i+1}" for i in range(len(vector))], y=vector, marker_color=colors, text=[f"{v:.2f}" for v in vector], textposition="outside", textfont=dict(size=9))
+    fig.add_trace(go.Bar(
+        x=[f"F{i+1}" for i in range(len(vector))],
+        y=vector,
+        marker_color=colors,
+        text=[f"{v:.2f}" for v in vector],
+        textposition="outside",
+        textfont=dict(size=9)
+    ))
     fig.update_layout(title=title, yaxis=dict(range=[0, 1.05]), height=320, margin=dict(l=30, r=20, t=40, b=50), template="plotly_white", showlegend=False)
     return fig
 
@@ -115,7 +122,7 @@ def process_correlation(files, use_rasta):
 
 
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
-    """Теперь полностью на реальных аудио из датасета — через тот же pipeline, что и вкладки 1 и 2."""
+    """Теперь полностью на реальных аудио из датасета — через тот же pipeline, что и вкладках 1 и 2."""
     global pipeline, global_speakers
     pipeline.use_rasta = use_rasta
 
