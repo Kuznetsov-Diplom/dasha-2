@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.20 (26-мерный — победитель эксперимента)
+Dasha v2 — Voice Feature Pipeline v2.22 (26-мерный RAW — без глобальной нормализации)
 
 - 13 MFCC (mean + std) = 26-мерный вектор
-- Без дельт — показал лучшую разделимость (inter ~0.25)
+- Без дельт
 - + RASTA + per-utterance CMVN
-- Глобальная нормализация: standard
+- **Без глобальной нормализации** (raw 26-dim)
+- Эксперимент: посмотреть реальные значения без глобальной нормализации
 """
 
 from __future__ import annotations
@@ -140,14 +141,8 @@ class VoiceFeaturePipeline:
         std_vec  = np.std(active, axis=1) + 1e-8
         features_26 = np.concatenate([mean_vec, std_vec])
 
-        if self.normalizer.params is not None:
-            normalized = self.normalizer.transform(features_26)
-        else:
-            q_low, q_high = np.percentile(features_26, [5, 95])
-            if q_high - q_low < 1e-8:
-                normalized = np.full(26, 0.5, dtype=np.float32)
-            else:
-                normalized = np.clip((features_26 - q_low) / (q_high - q_low), 0.0, 1.0)
+        # === БЕЗ ГЛОБАЛЬНОЙ НОРМАЛИЗАЦИИ (raw) ===
+        normalized = features_26.astype(np.float32)   # сырой вектор
 
         return {
             "normalized_vector": normalized.tolist(),
@@ -158,7 +153,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.20 (26-dim winner)"
+            "pipeline_version": "2.22 (26-dim RAW, no global norm)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
