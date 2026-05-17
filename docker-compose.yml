@@ -30,5 +30,17 @@ services:
     ports:
       - "7860:7860"
 
+  # Умная админка PostgreSQL (pgAdmin) — отдельный сервис
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@dasha.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+
 volumes:
   postgres_data:
