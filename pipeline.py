@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.25 FINAL
+Dasha v2 — Voice Feature Pipeline v2.26
 
-- 26-dim (13 mean + 13 std) — официальный вектор проекта
-- RASTA = OFF (наилучшая разделимость)
+- 13-dim (mean MFCC only) — официальный вектор
+- 26-dim (mean + std) — experimental
+- RASTA = OFF
 - per-utterance CMVN
 - Готов к НПБК
 """
@@ -32,9 +33,10 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, use_std: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.use_deltas = use_deltas
+        self.use_std = use_std          # False = 13-dim (mean only), True = 26-dim
         self.vad_threshold = vad_threshold
         self.normalizer = normalizer or FeatureNormalizer(method="standard")
         self._load_normalizer_if_exists()
@@ -124,20 +126,14 @@ class VoiceFeaturePipeline:
             active = mfcc_norm
 
         mean_vec = np.mean(active, axis=1)
-        std_vec  = np.std(active, axis=1) + 1e-8
 
-        if self.use_deltas:
-            delta1 = librosa.feature.delta(active, order=1, axis=1)
-            delta2 = librosa.feature.delta(active, order=2, axis=1)
-            mean_d1 = np.mean(delta1, axis=1)
-            std_d1  = np.std(delta1, axis=1) + 1e-8
-            mean_d2 = np.mean(delta2, axis=1)
-            std_d2  = np.std(delta2, axis=1) + 1e-8
-            features = np.concatenate([mean_vec, std_vec, mean_d1, std_d1, mean_d2, std_d2])
-            dim_label = "39-dim (experimental)"
-        else:
+        if self.use_std:
+            std_vec = np.std(active, axis=1) + 1e-8
             features = np.concatenate([mean_vec, std_vec])
-            dim_label = "26-dim (official)"
+            dim_label = "26-dim (mean + std, experimental)"
+        else:
+            features = mean_vec
+            dim_label = "13-dim (mean only)"
 
         normalized = features.astype(np.float32)
 
@@ -150,9 +146,10 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_deltas": self.use_deltas,
+            "use_std": self.use_std,
             "dim": len(features),
             "dim_label": dim_label,
-            "pipeline_version": "2.25 FINAL (26-dim, RASTA=OFF)"
+            "pipeline_version": "2.26 (13-dim mean only default)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -176,6 +173,6 @@ class VoiceFeaturePipeline:
         }
 
 
-def process_phrase(audio_path: str | Path, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
-    pipeline = VoiceFeaturePipeline(use_deltas=use_deltas, normalizer=normalizer)
+def process_phrase(audio_path: str | Path, use_deltas: bool = False, use_std: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
+    pipeline = VoiceFeaturePipeline(use_deltas=use_deltas, use_std=use_std, normalizer=normalizer)
     return pipeline.extract_features(audio_path)
