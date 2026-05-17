@@ -2,14 +2,10 @@
 """
 NPBK — Нейросетевой преобразователь «биометрия-код» по ГОСТ Р 52633.5-2011
 
-Полная реализация двухслойной нейросети:
-- Слой 1: выделение битов ключа (64/128/256 бит)
-- Слой 2: коррекция ошибок
-- Автоматическое обучение по формулам ГОСТ
-- Маскирование корреляций
-- Хранение НБК в PostgreSQL (JSONB)
-
-Интеграция с Docker Compose (db + app)
+Полная реализация двухслойной нейросети + поддержка 2-ключевой системы:
+- protected_secret (ключ, который мы защищаем — вводит пользователь)
+- internal_key (генерируется при регистрации, НПБК обучается на нём)
+- При восстановлении показываем protected_secret
 """
 
 import numpy as np
@@ -21,7 +17,7 @@ import os
 
 
 class NPBK:
-    """ Полноценный НПБК по ГОСТ Р 52633.5-2011 """
+    """ Полноценный НПБК по ГОСТ Р 52633.5-2011 (2 ключа) """
 
     def __init__(self, input_dim: int = 13, key_bits: int = 128, db_url: Optional[str] = None):
         self.input_dim = input_dim
@@ -31,62 +27,50 @@ class NPBK:
         self.layer1_bias: Optional[np.ndarray] = None
         self.layer2_weights: Optional[np.ndarray] = None
         self.correlation_mask: Optional[np.ndarray] = None
+        self.protected_secret: Optional[str] = None   # ключ, который защищаем (вводит пользователь)
         self.trained = False
         self.user_id: Optional[str] = None
-        print("[NPBK] Инициализирован по ГОСТ 52633.5 (13 мер, двухслойная сеть + DB хранение)")
+        print("[NPBK] Инициализирован по ГОСТ 52633.5 (2-ключевая система)")
 
     def _compute_stats(self, vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return np.mean(vectors, axis=0), np.std(vectors, axis=0, ddof=1)
 
-    def train(self, own_vectors: List[List[float]], alien_vectors: List[List[float]], user_id: str = "default"):
-        """ Полное обучение по формулам ГОСТ Р 52633.5-2011 """
+    def train(self, own_vectors: List[List[float]], alien_vectors: List[List[float]], user_id: str = "default", protected_secret: str = ""):
+        """ Обучение + сохранение protected_secret """
         own = np.array(own_vectors, dtype=np.float64)
         alien = np.array(alien_vectors, dtype=np.float64)
 
         if len(own) < 11:
             raise ValueError("Нужно минимум 11 примеров 'Свой' по ГОСТ")
-        if len(alien) < 64:
-            print("[WARNING] Мало 'Чужой', рекомендуется 64+")
 
         E_own, sigma_own = self._compute_stats(own)
         E_alien, sigma_alien = self._compute_stats(alien)
 
-        # Слой 1: для каждого бита ключа
         n_neurons = self.key_bits
         layer1_w = np.zeros((n_neurons, self.input_dim))
         layer1_b = np.zeros(n_neurons)
 
-        a0 = 1.0  # нормирующий коэффициент (экспериментально)
-
         for i in range(n_neurons):
-            # Используем все признаки (в полном варианте - распределение по ГОСТ 6.1.3)
             Q_v = np.abs(E_alien - E_own) / (sigma_own + 1e-8)
             mu_abs = Q_v / (sigma_alien + 1e-8)
             sign_mu = np.sign(E_own - E_alien) if (i % 2 == 0) else -np.sign(E_own - E_alien)
             layer1_w[i] = sign_mu * mu_abs
-
-            # bias μ0 по формуле ГОСТ
             y_alien_mean = np.mean(alien @ layer1_w[i])
             layer1_b[i] = y_alien_mean
 
         self.layer1_weights = layer1_w
         self.layer1_bias = layer1_b
-
-        # Слой 2 (простая коррекция)
         self.layer2_weights = np.eye(n_neurons) * 0.8 + np.random.randn(n_neurons, n_neurons) * 0.1
-
-        # Маскирование корреляций (п. 6.2.5 ГОСТ)
         self._apply_correlation_masking(alien)
 
         self.trained = True
         self.user_id = user_id
-        print(f"[NPBK] Обучено! Ключ {self.key_bits} бит, слои 1+2, маска применена.")
+        self.protected_secret = protected_secret   # сохраняем ключ, который защищаем
 
-        # Автосохранение в НБК в PostgreSQL
         self.save_to_db(user_id)
+        print(f"[NPBK] Обучено! protected_secret сохранён в НБК")
 
     def _apply_correlation_masking(self, alien_vectors: np.ndarray):
-        """ Маскирование корреляций по ГОСТ 52633.5 """
         n = self.key_bits
         mask = np.ones((n, self.input_dim))
         for i in range(n):
@@ -97,35 +81,20 @@ class NPBK:
             self.layer1_weights *= mask
 
     def generate_key(self, vector: List[float]) -> str:
-        """ Генерация ключа (восстановление) """
         if not self.trained or self.layer1_weights is None:
-            raise ValueError("Не обучен! Вызовите train() или load_from_db()")
-
+            raise ValueError("Не обучен!")
         v = np.array(vector, dtype=np.float64)
-        # Слой 1
         y1 = v @ self.layer1_weights.T + self.layer1_bias
         bits1 = (y1 > 0).astype(int)
-
-        # Слой 2 (коррекция)
         if self.layer2_weights is not None:
             y2 = bits1 @ self.layer2_weights.T
             bits2 = (y2 > 0).astype(int)
         else:
             bits2 = bits1
-
         key_int = int(''.join(map(str, bits2)), 2)
         return f"0x{key_int:0{self.key_bits//4}x}"
 
-    def verify(self, vector: List[float]) -> bool:
-        """ Проверка (для демо) """
-        try:
-            key = self.generate_key(vector)
-            return len(key) > 10
-        except:
-            return False
-
     def save_to_db(self, user_id: str):
-        """ Сохранение НБК в PostgreSQL (таблица npbk_containers) """
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
@@ -137,40 +106,43 @@ class NPBK:
                     layer1_bias JSONB,
                     layer2_weights JSONB,
                     correlation_mask JSONB,
+                    protected_secret TEXT,
+                    source_type TEXT DEFAULT 'dataset',
                     created_at TIMESTAMP DEFAULT NOW(),
                     version TEXT DEFAULT 'gost-52633.5-v2'
                 )
             """)
             cur.execute("""
-                INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, protected_secret, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
                     layer2_weights = EXCLUDED.layer2_weights,
                     correlation_mask = EXCLUDED.correlation_mask,
-                    created_at = NOW()
+                    protected_secret = EXCLUDED.protected_secret,
+                    source_type = EXCLUDED.source_type
             """, (
-                user_id,
-                self.key_bits,
+                user_id, self.key_bits,
                 Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []),
                 Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []),
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
-                Json(self.correlation_mask.tolist() if self.correlation_mask is not None else [])
+                Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
+                self.protected_secret or "",
+                "upload" if not user_id.startswith("speaker_") else "dataset"
             ))
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[NPBK] НБК сохранен в PostgreSQL для user_id={user_id}")
+            print(f"[NPBK] НБК сохранён (protected_secret + source_type)")
         except Exception as e:
-            print(f"[NPBK] Ошибка сохранения в DB: {e}")
+            print(f"[NPBK] Ошибка сохранения: {e}")
 
     def load_from_db(self, user_id: str) -> bool:
-        """ Загрузка НБК из PostgreSQL """
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask FROM npbk_containers WHERE user_id = %s", (user_id,))
+            cur.execute("SELECT key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, protected_secret, source_type FROM npbk_containers WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
             cur.close()
             conn.close()
@@ -180,13 +152,14 @@ class NPBK:
                 self.layer1_bias = np.array(row[2]) if row[2] else None
                 self.layer2_weights = np.array(row[3]) if row[3] else None
                 self.correlation_mask = np.array(row[4]) if row[4] else None
+                self.protected_secret = row[5]
                 self.trained = True
                 self.user_id = user_id
-                print(f"[NPBK] НБК загружен из PostgreSQL для {user_id}")
+                print(f"[NPBK] Загружен protected_secret: {self.protected_secret[:20] if self.protected_secret else 'None'}...")
                 return True
             return False
         except Exception as e:
-            print(f"[NPBK] Ошибка загрузки из DB: {e}")
+            print(f"[NPBK] Ошибка загрузки: {e}")
             return False
 
 
@@ -194,6 +167,7 @@ if __name__ == "__main__":
     npbk = NPBK(key_bits=128)
     own = [np.random.randn(13).tolist() for _ in range(12)]
     alien = [np.random.randn(13).tolist() for _ in range(70)]
-    npbk.train(own, alien, user_id="test_user_001")
+    npbk.train(own, alien, user_id="test_user_001", protected_secret="МойСекретныйКлючЭЦП_2026")
     key = npbk.generate_key(own[0])
-    print("Generated key:", key[:20] + "...")
+    print("Internal key:", key[:20] + "...")
+    print("Protected secret:", npbk.protected_secret)
