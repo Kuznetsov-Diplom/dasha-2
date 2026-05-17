@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Dasha v2.27 — Voice Feature Pipeline (FINAL)
+Dasha v2.28 — Voice Feature Pipeline (FINAL + RASTA)
 
 - 13-dim (mean only) — официальный
 - global_minmax_abs — официальный метод нормализации
-- RASTA = OFF
+- RASTA = ON (по умолчанию) для устойчивости к канальным искажениям
+- Исправлен CMVN (per-feature)
 - Готов к НПБК по ГОСТ Р 52633.5
+- Соответствует гл. 2 диплома: MFCC + RASTA + CMVN
 """
 
 from __future__ import annotations
 import numpy as np
 import librosa
+import scipy.signal as signal
 from typing import Dict, Any, Optional
 from pathlib import Path
 import json
@@ -30,7 +33,7 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = True, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.use_deltas = use_deltas
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax_abs")
@@ -79,12 +82,31 @@ class VoiceFeaturePipeline:
 
     @staticmethod
     def _cmvn(mfcc: np.ndarray, window: int = 301) -> np.ndarray:
+        """Корректный CMVN per-feature (по каждому MFCC-коэффициенту во времени)"""
         mfcc = mfcc.astype(np.float32)
-        if mfcc.shape[1] < window:
-            window = mfcc.shape[1]
-        mean = np.convolve(mfcc.mean(axis=0), np.ones(window)/window, mode='same')
-        std = np.convolve(mfcc.std(axis=0), np.ones(window)/window, mode='same') + 1e-8
-        return (mfcc - mean) / std
+        n_coeffs, n_frames = mfcc.shape
+        if n_frames < window:
+            window = n_frames
+        mfcc_norm = np.zeros_like(mfcc)
+        for c in range(n_coeffs):
+            feat = mfcc[c]
+            local_mean = np.convolve(feat, np.ones(window) / window, mode='same')
+            # Простая оценка локального std
+            local_std = np.convolve(np.abs(feat - local_mean), np.ones(window) / window, mode='same') + 1e-8
+            mfcc_norm[c] = (feat - local_mean) / local_std
+        return mfcc_norm
+
+    def _apply_rasta(self, mfcc: np.ndarray) -> np.ndarray:
+        """RASTA-фильтр для подавления медленных вариаций (канал, микрофон) — повышает стабильность по ГОСТ"""
+        if not self.use_rasta or mfcc.shape[1] < 5:
+            return mfcc
+        # Стандартный RASTA IIR (приближение для cepstral features)
+        b = np.array([0.2, 0.1, 0.0, -0.1, -0.2], dtype=np.float32)
+        a = np.array([1.0, -0.94], dtype=np.float32)
+        rasta_mfcc = np.zeros_like(mfcc)
+        for i in range(mfcc.shape[0]):
+            rasta_mfcc[i] = signal.lfilter(b, a, mfcc[i])
+        return rasta_mfcc
 
     def extract_features(self, audio_input: str | np.ndarray | Path, sr: Optional[int] = None) -> Dict[str, Any]:
         if isinstance(audio_input, (str, Path)):
@@ -115,25 +137,41 @@ class VoiceFeaturePipeline:
 
         mfcc_norm = self._cmvn(mfcc)
 
+        if self.use_rasta:
+            mfcc_norm = self._apply_rasta(mfcc_norm)
+
         if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
             active = mfcc_norm[:, vad_mask]
         else:
             active = mfcc_norm
 
         mean_vec = np.mean(active, axis=1)
-        normalized = self.normalizer.transform(mean_vec)
+
+        # Опционально: Delta (для будущих экспериментов, по умолчанию OFF для 13-dim официального)
+        if self.use_deltas and active.shape[1] > 2:
+            delta = librosa.feature.delta(active)
+            delta2 = librosa.feature.delta(active, order=2)
+            full_vec = np.concatenate([mean_vec, np.mean(delta, axis=1), np.mean(delta2, axis=1)])
+            dim = 39
+            dim_label = "39-dim (MFCC+Delta+Delta2) + RASTA + global_minmax_abs"
+        else:
+            full_vec = mean_vec
+            dim = 13
+            dim_label = "13-dim (mean only) + RASTA + global_minmax_abs"
+
+        normalized = self.normalizer.transform(full_vec)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": mean_vec.tolist(),
+            "raw_mean_vector": full_vec.tolist(),
             "mfcc_rasta": mfcc_norm,
-            "features": mean_vec,
+            "features": full_vec,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
-            "dim": 13,
-            "dim_label": "13-dim (mean only) + global_minmax_abs",
-            "pipeline_version": "v2.27 FINAL"
+            "dim": dim,
+            "dim_label": dim_label,
+            "pipeline_version": "v2.28 RASTA+CMVN_FIXED"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
