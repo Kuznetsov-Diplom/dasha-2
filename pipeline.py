@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.3
+Dasha v2 — Voice Feature Pipeline v2.5
 
-Ключевые улучшения v2.3:
-- Улучшен fallback нормализации (robust percentile 5-95%) — бары теперь более разнообразные, меньше "прямой линии"
-- Высокая энтропия и разделимость признаков для НПБК
+Изменения v2.5:
+- Убран внутренний CMVN (он обнулял средние значения кепстральных коэффициентов и "сглаживал" особенности голоса)
+- Теперь mean_vector сохраняет реальные уровни формант и тембра — бары стали более разнообразными и информативными
+- Оставлен только RASTA + дельты + финальная robust нормализация
 """
 
 from __future__ import annotations
@@ -102,7 +103,7 @@ class VoiceFeaturePipeline:
             mfcc_rasta = np.zeros_like(mfcc)
             for i in range(mfcc.shape[0]):
                 mfcc_rasta[i] = self._rasta_filter(mfcc[i], self.RASTA_POLE)
-            mfcc_rasta = (mfcc_rasta - np.mean(mfcc_rasta, axis=1, keepdims=True)) / (np.std(mfcc_rasta, axis=1, keepdims=True) + 1e-8)
+            # CMVN УБРАН — теперь mean_vector сохраняет реальные уровни кепстральных коэффициентов (формантная структура голоса)
         else:
             mfcc_rasta = mfcc.copy()
 
@@ -120,7 +121,6 @@ class VoiceFeaturePipeline:
         if self.normalizer.params is not None:
             normalized = self.normalizer.transform(mean_vector)
         else:
-            # Robust scaling (5-95 percentile) — больше разнообразия в барах, меньше "прямой линии"
             q_low, q_high = np.percentile(mean_vector, [5, 95])
             if q_high - q_low < 1e-8:
                 normalized = np.full(39, 0.5, dtype=np.float32)
@@ -136,7 +136,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.3"
+            "pipeline_version": "2.5"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
