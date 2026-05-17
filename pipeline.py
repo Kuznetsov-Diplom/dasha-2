@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.22 (26-мерный RAW — без глобальной нормализации)
+Dasha v2 — Voice Feature Pipeline v2.23
 
-- 13 MFCC (mean + std) = 26-мерный вектор
-- Без дельт
-- + RASTA + per-utterance CMVN
-- **Без глобальной нормализации** (raw 26-dim)
-- Эксперимент: посмотреть реальные значения без глобальной нормализации
+- 26-dim (по умолчанию): 13 MFCC mean + 13 std (RASTA + per-utterance CMVN)
+- Опционально: + Delta + Delta-Delta → 39-dim
+- Полностью соответствует эксперименту v2.19 (26-dim — лучший по intra-correlation ~0.97)
+- Готово к НПБК по ГОСТ Р 52633.5
 """
 
 from __future__ import annotations
@@ -34,8 +33,9 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = True, use_deltas: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
+        self.use_deltas = use_deltas
         self.vad_threshold = vad_threshold
         self.normalizer = normalizer or FeatureNormalizer(method="standard")
         self._load_normalizer_if_exists()
@@ -139,21 +139,36 @@ class VoiceFeaturePipeline:
 
         mean_vec = np.mean(active, axis=1)
         std_vec  = np.std(active, axis=1) + 1e-8
-        features_26 = np.concatenate([mean_vec, std_vec])
 
-        # === БЕЗ ГЛОБАЛЬНОЙ НОРМАЛИЗАЦИИ (raw) ===
-        normalized = features_26.astype(np.float32)   # сырой вектор
+        if self.use_deltas:
+            # Дельты после RASTA+CMVN (39-dim)
+            delta1 = librosa.feature.delta(active, order=1, axis=1)
+            delta2 = librosa.feature.delta(active, order=2, axis=1)
+            mean_d1 = np.mean(delta1, axis=1)
+            std_d1  = np.std(delta1, axis=1) + 1e-8
+            mean_d2 = np.mean(delta2, axis=1)
+            std_d2  = np.std(delta2, axis=1) + 1e-8
+            features = np.concatenate([mean_vec, std_vec, mean_d1, std_d1, mean_d2, std_d2])
+            dim_label = "39-dim (MFCC + Δ + ΔΔ)"
+        else:
+            features = np.concatenate([mean_vec, std_vec])
+            dim_label = "26-dim (MFCC only)"
+
+        normalized = features.astype(np.float32)
 
         return {
             "normalized_vector": normalized.tolist(),
-            "raw_mean_vector": features_26,
+            "raw_mean_vector": features,
             "mfcc_rasta": mfcc_rasta,
-            "features_26": features_26,
+            "features": features,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.22 (26-dim RAW, no global norm)"
+            "use_deltas": self.use_deltas,
+            "dim": len(features),
+            "dim_label": dim_label,
+            "pipeline_version": "2.23 (26/39-dim, RASTA+CMVN+Delta optional)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -177,6 +192,6 @@ class VoiceFeaturePipeline:
         }
 
 
-def process_phrase(audio_path: str | Path, use_rasta: bool = True, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
-    pipeline = VoiceFeaturePipeline(use_rasta=use_rasta, normalizer=normalizer)
+def process_phrase(audio_path: str | Path, use_rasta: bool = True, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
+    pipeline = VoiceFeaturePipeline(use_rasta=use_rasta, use_deltas=use_deltas, normalizer=normalizer)
     return pipeline.extract_features(audio_path)

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.22
+Dasha v2 — Gradio интерфейс v2.23
 
-- Исправлена ошибка выходов в массовом тесте (4 значения возвращалось, а outputs=3)
-- Это могло приводить к нестабильному обновлению графиков и "прыжкам" к первому графику
-- Все графики теперь обновляются корректно и независимо
-- Улучшена стабильность интерфейса
+- 26-dim (default) или 39-dim (+Δ+ΔΔ)
+- Все графики обновляются надёжно
+- Готово к НПБК по ГОСТ Р 52633.5
 """
 import gradio as gr
 import numpy as np
@@ -19,7 +18,7 @@ from pipeline import VoiceFeaturePipeline
 from normalizer import FeatureNormalizer
 from cv_ru_loader import load_speakers_with_audio
 
-pipeline = VoiceFeaturePipeline(use_rasta=True)
+pipeline = VoiceFeaturePipeline(use_rasta=True, use_deltas=False)
 normalizer = FeatureNormalizer(method="standard")
 
 global_speakers = {}
@@ -42,7 +41,7 @@ def get_random_speaker():
         return None
     return random.choice(speaker_list)
 
-def _collect_real_vectors(max_vecs: int = 2000):
+def _collect_real_vectors(max_vecs: int = 2000, use_deltas: bool = False):
     vecs = []
     if not global_speakers:
         return vecs
@@ -50,7 +49,7 @@ def _collect_real_vectors(max_vecs: int = 2000):
     for speaker_id, audio_paths in sorted_sp:
         for path in audio_paths[:12]:
             try:
-                res = pipeline.extract_features(path)
+                res = pipeline.extract_features(path)  # pipeline уже с use_deltas
                 vecs.append(res["normalized_vector"])
                 if len(vecs) >= max_vecs:
                     return vecs
@@ -58,7 +57,7 @@ def _collect_real_vectors(max_vecs: int = 2000):
                 continue
     return vecs
 
-real_vecs = _collect_real_vectors(2000)
+real_vecs = _collect_real_vectors(2000, use_deltas=False)
 if real_vecs:
     arr = np.array(real_vecs)
     normalizer.fit(arr)
@@ -92,9 +91,10 @@ def create_correlation_heatmap(vectors: list, labels: list) -> go.Figure:
     fig.update_layout(title="Матрица корреляций векторов (0–1)", height=380, margin=dict(l=60, r=20, t=40, b=60))
     return fig
 
-def process_single_phrase(mode, audio, use_rasta, speaker_id=None, file_path=None):
+def process_single_phrase(mode, audio, use_rasta, use_deltas, speaker_id=None, file_path=None):
     global pipeline
     pipeline.use_rasta = use_rasta
+    pipeline.use_deltas = use_deltas
     path = None
     if mode == "Из датасета" and speaker_id and speaker_id in global_speakers:
         path = random.choice(global_speakers[speaker_id])
@@ -111,9 +111,10 @@ def process_single_phrase(mode, audio, use_rasta, speaker_id=None, file_path=Non
         result = pipeline.extract_features(path)
         vec = result["normalized_vector"]
         mfcc = result.get("mfcc_rasta", np.zeros((13, 10)))
-        md = f"**✅ 26-мерный вектор** | {mode}"
+        dim_label = result.get("dim_label", "26-dim")
+        md = f"**✅ {dim_label}** | {mode} | RASTA={'ON' if use_rasta else 'OFF'} | Delta={'ON' if use_deltas else 'OFF'}"
         fig_wave = create_waveform_plot(result["y_pre"], result["sr"], "Предобработанный сигнал")
-        fig_vec = create_vector_bar_plot(vec)
+        fig_vec = create_vector_bar_plot(vec, title=f"{dim_label} (mean + std)")
         fig_mfcc = create_mfcc_heatmap(mfcc)
         quality = pipeline.get_feature_quality_metrics([np.array(vec)])
         quality_md = f"**Quality:** cosine = {quality.get('mean_cosine_similarity', 'N/A')} | corr = {quality.get('mean_feature_correlation', 'N/A')} | var = {quality.get('feature_variance_proxy', 'N/A')}"
@@ -121,9 +122,10 @@ def process_single_phrase(mode, audio, use_rasta, speaker_id=None, file_path=Non
     except Exception as e:
         return f"Ошибка: {str(e)}", None, None, None, ""
 
-def process_correlation(mode, files, use_rasta, speaker_id=None):
+def process_correlation(mode, files, use_rasta, use_deltas, speaker_id=None):
     global pipeline
     pipeline.use_rasta = use_rasta
+    pipeline.use_deltas = use_deltas
     paths = []
     if mode == "Из датасета" and speaker_id and speaker_id in global_speakers:
         paths = random.sample(global_speakers[speaker_id], min(10, len(global_speakers[speaker_id])))
@@ -148,12 +150,13 @@ def process_correlation(mode, files, use_rasta, speaker_id=None):
         fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7))
     fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
     fig_lines.update_layout(title="Векторы vs Средний эталон", height=320, template="plotly_white")
-    md = f"**{len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}**"
+    md = f"**{len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}** | { '39-dim' if use_deltas else '26-dim' }"
     return md, fig_corr, fig_lines
 
-def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
+def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta, use_deltas):
     global pipeline, global_speakers
     pipeline.use_rasta = use_rasta
+    pipeline.use_deltas = use_deltas
     if not global_speakers:
         return "❌ Датасет не загружен.", None, None
     sorted_speakers = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:num_speakers]
@@ -188,32 +191,34 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     mean_intra = float(np.mean(intra_sims)) if intra_sims else 0.0
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
     rms_str = ", ".join([f"{r:.3f}" for r in speaker_rms])
-    md = f"**26-мерный вектор** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f}"
+    dim_label = "39-dim" if use_deltas else "26-dim"
+    md = f"**{dim_label}** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f}"
     unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
     fig_heat = create_correlation_heatmap(speaker_means, unique_labels)
     fig_lines = go.Figure()
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
     for s in range(len(speaker_means)):
-        fig_lines.add_trace(go.Scatter(x=list(range(26)), y=speaker_means[s], mode="lines+markers", name=f"Спикер {s+1} (RMS={speaker_rms[s]:.3f})", line=dict(width=2.5, color=colors[s % len(colors)]), marker=dict(size=5)))
-    fig_lines.update_layout(title=f"Средние векторы ({len(speaker_means)})", height=320, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    return md, fig_heat, fig_lines  # ИСПРАВЛЕНО: теперь ровно 3 значения под outputs
+        fig_lines.add_trace(go.Scatter(x=list(range(26 if not use_deltas else 39)), y=speaker_means[s], mode="lines+markers", name=f"Спикер {s+1} (RMS={speaker_rms[s]:.3f})", line=dict(width=2.5, color=colors[s % len(colors)]), marker=dict(size=5)))
+    fig_lines.update_layout(title=f"Средние векторы ({len(speaker_means)}) | {dim_label}", height=320, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    return md, fig_heat, fig_lines
 
-def train_normalizer(max_speakers, phrases):
+def train_normalizer(max_speakers, phrases, use_deltas=False):
     global normalizer, pipeline, global_speakers
     target = max_speakers * phrases
-    real_vecs = _collect_real_vectors(target)
+    real_vecs = _collect_real_vectors(target, use_deltas=use_deltas)
     if not real_vecs:
         return "❌ Нет данных."
     arr = np.array(real_vecs)
     normalizer.fit(arr)
     normalizer.save()
     pipeline.normalizer = normalizer
-    return f"✅ Нормализатор переобучен на {len(real_vecs)} векторах (26-dim)."
+    dim = 39 if use_deltas else 26
+    return f"✅ Нормализатор переобучен на {len(real_vecs)} векторах ({dim}-dim)."
 
-with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победитель) + НПБК") as demo:
+with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.22 — 26-мерный вектор (MFCC only) | два режима: Своя запись / Из датасета**  
+    **v2.23 — 26-dim (default) или 39-dim (+Δ+ΔΔ) | два режима**  
     Готово к нормализации и НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -229,7 +234,8 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
                         speaker_dd = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
                         btn_random = gr.Button("🎲 Случайный спикер", size="sm")
                     use_rasta_cb = gr.Checkbox(value=True, label="RASTA + CMVN")
-                    btn_process = gr.Button("🚀 Извлечь 26-мерный вектор", variant="primary")
+                    use_deltas_cb = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
+                    btn_process = gr.Button("🚀 Извлечь вектор", variant="primary")
                 with gr.Column(scale=2):
                     out_md = gr.Markdown()
                     out_wave = gr.Plot()
@@ -242,7 +248,7 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
 
             mode1.change(toggle_mode, inputs=mode1, outputs=[own_group, dataset_group])
             btn_random.click(lambda: get_random_speaker(), outputs=speaker_dd)
-            btn_process.click(process_single_phrase, inputs=[mode1, audio_in, use_rasta_cb, speaker_dd], outputs=[out_md, out_wave, out_vec, out_mfcc, out_quality])
+            btn_process.click(process_single_phrase, inputs=[mode1, audio_in, use_rasta_cb, use_deltas_cb, speaker_dd], outputs=[out_md, out_wave, out_vec, out_mfcc, out_quality])
 
         with gr.TabItem("2. Корреляция и стабильность"):
             with gr.Row():
@@ -255,6 +261,7 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
                         speaker_dd2 = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
                         btn_random2 = gr.Button("🎲 Загрузить 10 фраз случайного спикера", size="sm")
                     use_rasta2 = gr.Checkbox(value=True, label="RASTA")
+                    use_deltas2 = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
                 with gr.Column(scale=2):
                     corr_md = gr.Markdown()
@@ -266,43 +273,45 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
 
             mode2.change(toggle_mode2, inputs=mode2, outputs=[own_group2, dataset_group2])
             btn_random2.click(lambda: get_random_speaker(), outputs=speaker_dd2)
-            btn_corr.click(process_correlation, inputs=[mode2, files_in, use_rasta2, speaker_dd2], outputs=[corr_md, corr_heat, corr_lines])
+            btn_corr.click(process_correlation, inputs=[mode2, files_in, use_rasta2, use_deltas2, speaker_dd2], outputs=[corr_md, corr_heat, corr_lines])
 
         with gr.TabItem("3. Массовый тест + Research"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Параметры теста (26-мерный вектор)")
+                    gr.Markdown("### Параметры теста (26/39-dim)")
                     num_sp = gr.Slider(2, 12, value=8, step=1, label="Количество спикеров")
                     ph_per = gr.Slider(3, 15, value=8, step=1, label="Фраз на спикера")
                     use_rasta3 = gr.Checkbox(value=True, label="RASTA")
+                    use_deltas3 = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
                     btn_test = gr.Button("Запустить тест ГОСТ", variant="primary")
                 with gr.Column(scale=2):
                     test_md = gr.Markdown()
                     test_heat = gr.Plot()
                     test_lines = gr.Plot()
 
-            btn_test.click(run_gost_mass_test, inputs=[num_sp, ph_per, use_rasta3], outputs=[test_md, test_heat, test_lines])
+            btn_test.click(run_gost_mass_test, inputs=[num_sp, ph_per, use_rasta3, use_deltas3], outputs=[test_md, test_heat, test_lines])
 
         with gr.TabItem("4. Обучение нормализатора"):
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("### Глобальный нормализатор (26-мерный)")
+                    gr.Markdown("### Глобальный нормализатор (26/39-dim)")
                     max_sp = gr.Slider(10, 500, value=200, step=10, label="Макс. спикеров")
                     ph = gr.Slider(3, 15, value=10, step=1, label="Фраз на спикера")
+                    use_deltas_train = gr.Checkbox(value=False, label="Обучать на 39-dim")
                     btn_train = gr.Button("Переобучить на реальных данных", variant="primary")
                     train_out = gr.Markdown()
-            btn_train.click(train_normalizer, inputs=[max_sp, ph], outputs=train_out)
+            btn_train.click(train_normalizer, inputs=[max_sp, ph, use_deltas_train], outputs=train_out)
 
         with gr.TabItem("5. НПБК (в разработке)"):
             gr.Markdown("""
             ### Нейросетевой преобразователь «биометрия-код» (ГОСТ Р 52633.5)
-            **Текущий статус:** 26-мерный вектор готов к подаче на вход двухслойной нейросети.
+            **Текущий статус:** 26/39-мерный вектор готов к подаче на вход двухслойной нейросети.
             """)
             gr.Button("Сгенерировать ключ (заглушка)", interactive=False)
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.22** — 26-мерный вектор (победитель) | два режима ввода | 2808 спикеров | Май 2026.
+    **Dasha v2 v2.23** — 26-dim (default) / 39-dim (+Δ+ΔΔ) | два режима ввода | 2808 спикеров | Май 2026.
     """)
 
 if __name__ == "__main__":
