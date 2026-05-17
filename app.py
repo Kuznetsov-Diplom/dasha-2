@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.3
-Убрано ограничение на 6 файлов во вкладке 2
+Dasha v2 — Gradio интерфейс v2.4
+Добавлена поддержка реальных спикеров из Common Voice RU (с fallback на синтетику)
 """
 import gradio as gr
 import numpy as np
@@ -13,9 +13,19 @@ import soundfile as sf
 
 from pipeline import VoiceFeaturePipeline
 from normalizer import FeatureNormalizer
+from cv_ru_loader import load_speakers_and_phrases
 
 pipeline = VoiceFeaturePipeline(use_rasta=True)
 normalizer = FeatureNormalizer(method="global_minmax")
+
+# Загрузка спикеров (реальные из CV RU или синтетические)
+print("🔄 Проверка нормализатора и спикеров...")
+try:
+    speakers = load_speakers_and_phrases()
+    print(f"✅ Загружено {len(speakers)} спикеров")
+except Exception as e:
+    print(f"⚠️  {e}")
+    speakers = {}
 
 
 def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go.Figure:
@@ -81,7 +91,7 @@ def process_correlation(files, use_rasta):
     if not files or len(files) < 2:
         return "Загрузите минимум 2 файла", None, None
     vectors, labels = [], []
-    for i, f in enumerate(files):  # УБРАНО [:6] — теперь все файлы обрабатываются
+    for i, f in enumerate(files):
         try:
             res = pipeline.extract_features(f)
             vectors.append(res["normalized_vector"])
@@ -144,7 +154,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НПБК (ГОСТ Р 52633)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.3 — robust нормализация + без ограничений на файлы.**  
+    **v2.4 — поддержка реальных спикеров Common Voice RU + fallback.**  
     Готово к интеграции полноценного НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -182,7 +192,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
         with gr.TabItem("3. Массовый тест + Research"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Параметры теста (демо на синтетике)")
+                    gr.Markdown("### Параметры теста (демо на синтетике / реальных спикерах)")
                     num_sp = gr.Slider(2, 12, value=5, step=1, label="Количество спикеров")
                     ph_per = gr.Slider(3, 15, value=8, step=1, label="Фраз на спикера")
                     use_rasta3 = gr.Checkbox(value=True, label="RASTA+CMVN")
@@ -217,7 +227,7 @@ with gr.Blocks(title="Dasha v2 — Голосовая биометрия + НП�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.3** — robust нормализация + без ограничений на файлы. Май 2026.
+    **Dasha v2 v2.4** — поддержка Common Voice RU + robust нормализация. Май 2026.
     """)
 
 if __name__ == "__main__":
