@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-NPBK — Нейросетевой преобразователь «биометрия-код» по ГОСТ Р 52633.5-2011
+NPBK v2.33 — Правильная реализация по ГОСТ Р 52633.5-2011
 
-Полная реализация двухслойной нейросети + поддержка 2-ключевой системы:
-- protected_secret (ключ, который мы защищаем — вводит пользователь)
-- internal_key (генерируется при регистрации, НПБК обучается на нём)
-- При восстановлении показываем protected_secret
+Исправлено:
+- Оригинальный protected_secret НЕ сохраняется в БД (критически важно для безопасности)
+- Нейросеть обучается восстанавливать ключ из биометрии
 """
 
 import numpy as np
@@ -17,7 +16,7 @@ import os
 
 
 class NPBK:
-    """ Полноценный НПБК по ГОСТ Р 52633.5-2011 (2 ключа) """
+    """ Полноценный НПБК по ГОСТ Р 52633.5-2011 (2-ключевая система) """
 
     def __init__(self, input_dim: int = 13, key_bits: int = 128, db_url: Optional[str] = None):
         self.input_dim = input_dim
@@ -27,16 +26,15 @@ class NPBK:
         self.layer1_bias: Optional[np.ndarray] = None
         self.layer2_weights: Optional[np.ndarray] = None
         self.correlation_mask: Optional[np.ndarray] = None
-        self.protected_secret: Optional[str] = None   # ключ, который защищаем (вводит пользователь)
         self.trained = False
         self.user_id: Optional[str] = None
-        print("[NPBK] Инициализирован по ГОСТ 52633.5 (2-ключевая система)")
+        print("[NPBK] Инициализирован по ГОСТ 52633.5 (protected_secret не сохраняется в БД)")
 
     def _compute_stats(self, vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return np.mean(vectors, axis=0), np.std(vectors, axis=0, ddof=1)
 
-    def train(self, own_vectors: List[List[float]], alien_vectors: List[List[float]], user_id: str = "default", protected_secret: str = ""):
-        """ Обучение + сохранение protected_secret """
+    def train(self, own_vectors: List[List[float]], alien_vectors: List[List[float]], user_id: str = "default"):
+        """ Обучение без сохранения protected_secret в БД """
         own = np.array(own_vectors, dtype=np.float64)
         alien = np.array(alien_vectors, dtype=np.float64)
 
@@ -65,10 +63,9 @@ class NPBK:
 
         self.trained = True
         self.user_id = user_id
-        self.protected_secret = protected_secret   # сохраняем ключ, который защищаем
 
         self.save_to_db(user_id)
-        print(f"[NPBK] Обучено! protected_secret сохранён в НБК")
+        print(f"[NPBK] Обучено! Ключ защищён биометрией (без сохранения в БД)")
 
     def _apply_correlation_masking(self, alien_vectors: np.ndarray):
         n = self.key_bits
@@ -106,21 +103,19 @@ class NPBK:
                     layer1_bias JSONB,
                     layer2_weights JSONB,
                     correlation_mask JSONB,
-                    protected_secret TEXT,
                     source_type TEXT DEFAULT 'dataset',
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'gost-52633.5-v2'
+                    version TEXT DEFAULT 'gost-52633.5-v2.33'
                 )
             """)
             cur.execute("""
-                INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, protected_secret, source_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
                     layer2_weights = EXCLUDED.layer2_weights,
                     correlation_mask = EXCLUDED.correlation_mask,
-                    protected_secret = EXCLUDED.protected_secret,
                     source_type = EXCLUDED.source_type
             """, (
                 user_id, self.key_bits,
@@ -128,13 +123,12 @@ class NPBK:
                 Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []),
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
-                self.protected_secret or "",
                 "upload" if not user_id.startswith("speaker_") else "dataset"
             ))
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[NPBK] НБК сохранён (protected_secret + source_type)")
+            print(f"[NPBK] НБК сохранён в БД (protected_secret не сохраняется)")
         except Exception as e:
             print(f"[NPBK] Ошибка сохранения: {e}")
 
@@ -142,7 +136,7 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, protected_secret, source_type FROM npbk_containers WHERE user_id = %s", (user_id,))
+            cur.execute("SELECT key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, source_type FROM npbk_containers WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
             cur.close()
             conn.close()
@@ -152,10 +146,9 @@ class NPBK:
                 self.layer1_bias = np.array(row[2]) if row[2] else None
                 self.layer2_weights = np.array(row[3]) if row[3] else None
                 self.correlation_mask = np.array(row[4]) if row[4] else None
-                self.protected_secret = row[5]
                 self.trained = True
                 self.user_id = user_id
-                print(f"[NPBK] Загружен protected_secret: {self.protected_secret[:20] if self.protected_secret else 'None'}...")
+                print(f"[NPBK] НБК загружен из БД")
                 return True
             return False
         except Exception as e:
@@ -167,7 +160,6 @@ if __name__ == "__main__":
     npbk = NPBK(key_bits=128)
     own = [np.random.randn(13).tolist() for _ in range(12)]
     alien = [np.random.randn(13).tolist() for _ in range(70)]
-    npbk.train(own, alien, user_id="test_user_001", protected_secret="МойСекретныйКлючЭЦП_2026")
+    npbk.train(own, alien, user_id="test_user_001")
     key = npbk.generate_key(own[0])
     print("Internal key:", key[:20] + "...")
-    print("Protected secret:", npbk.protected_secret)
