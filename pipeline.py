@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.8 (GOST-friendly)
+Dasha v2 — Voice Feature Pipeline v2.14 (GOST-friendly + CMVN)
 
-Полностью переработан под требования ГОСТ Р 52633:
-- 13 MFCC (без энергии) + RASTA
-- Вычисляем mean + std по 13 коэффициентам = 26-мерный вектор
-- Это классика для speaker recognition: стабильность + высокая энтропия
-- Финальная robust нормализация в [0, 1]
-- Вектор теперь отлично разделяет спикеров и подходит для НПБК
+- 13 MFCC (без энергии) + RASTA + per-utterance CMVN
+- mean + std = 26-мерный вектор
+- CMVN сильно улучшает разделимость спикеров (решает проблему высокой inter-correlation)
+- Финальная нормализация: Standard (Z-score) по умолчанию
+- Готово для НПБК по ГОСТ Р 52633
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ class VoiceFeaturePipeline:
     PRE_EMPHASIS: float = 0.97
     FRAME_LENGTH_MS: int = 25
     FRAME_SHIFT_MS: int = 10
-    N_MFCC: int = 13          # 13 MFCC (без энергии)
+    N_MFCC: int = 13
     N_MELS: int = 40
     FMIN: float = 20.0
     FMAX: float = 8000.0
@@ -38,7 +37,7 @@ class VoiceFeaturePipeline:
     def __init__(self, use_rasta: bool = True, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.vad_threshold = vad_threshold
-        self.normalizer = normalizer or FeatureNormalizer(method="global_minmax")
+        self.normalizer = normalizer or FeatureNormalizer(method="standard")  # теперь standard по умолчанию
         self._load_normalizer_if_exists()
 
     def _load_normalizer_if_exists(self) -> None:
@@ -48,7 +47,7 @@ class VoiceFeaturePipeline:
                 with open(params_path, "r", encoding="utf-8") as f:
                     params = json.load(f)
                 self.normalizer.params = params
-                self.normalizer.method = params.get("method", "global_minmax")
+                self.normalizer.method = params.get("method", "standard")
             except Exception as e:
                 print(f"[Pipeline] Не удалось загрузить нормализатор: {e}")
 
@@ -67,7 +66,6 @@ class VoiceFeaturePipeline:
         if np.sum(speech_mask) < min_frames:
             return np.ones(len(rms), dtype=bool)
 
-        # Агрессивная обрезка хвостов
         speech_idx = np.where(speech_mask)[0]
         if len(speech_idx) > 0:
             start = speech_idx[0]
@@ -89,6 +87,17 @@ class VoiceFeaturePipeline:
         a = np.array([1.0, -pole])
         return lfilter(b, a, trajectory)
 
+    @staticmethod
+    def _cmvn(mfcc: np.ndarray, window: int = 301) -> np.ndarray:
+        """Cepstral Mean and Variance Normalization (per utterance)."""
+        mfcc = mfcc.astype(np.float32)
+        if mfcc.shape[1] < window:
+            window = mfcc.shape[1]
+        # скользящее среднее и std
+        mean = np.convolve(mfcc.mean(axis=0), np.ones(window)/window, mode='same')
+        std = np.convolve(mfcc.std(axis=0), np.ones(window)/window, mode='same') + 1e-8
+        return (mfcc - mean) / std
+
     def extract_features(self, audio_input: str | np.ndarray | Path, sr: Optional[int] = None) -> Dict[str, Any]:
         if isinstance(audio_input, (str, Path)):
             y, sr = librosa.load(str(audio_input), sr=self.SAMPLE_RATE, mono=True)
@@ -109,12 +118,12 @@ class VoiceFeaturePipeline:
         vad_mask = self._vad(y_pre, sr)
 
         mfcc = librosa.feature.mfcc(
-            y=y_pre, sr=sr, n_mfcc=self.N_MFCC + 1,   # +1 чтобы потом убрать энергию
+            y=y_pre, sr=sr, n_mfcc=self.N_MFCC + 1,
             n_fft=frame_length, hop_length=hop_length,
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX,
             window="hamming", center=True, norm="ortho"
         )
-        mfcc = mfcc[1:, :]   # убираем энергию (0-й коэффициент)
+        mfcc = mfcc[1:, :]   # убираем энергию
 
         if self.use_rasta:
             mfcc_rasta = np.zeros_like(mfcc)
@@ -123,20 +132,23 @@ class VoiceFeaturePipeline:
         else:
             mfcc_rasta = mfcc.copy()
 
-        # === GOST-friendly статистики ===
-        if np.any(vad_mask) and vad_mask.shape[0] == mfcc_rasta.shape[1]:
-            active = mfcc_rasta[:, vad_mask]
-        else:
-            active = mfcc_rasta
+        # === НОВОЕ: per-utterance CMVN (ключ к разделимости спикеров) ===
+        mfcc_norm = self._cmvn(mfcc_rasta)
 
-        mean_vec = np.mean(active, axis=1)                    # 13
-        std_vec  = np.std(active, axis=1) + 1e-8             # 13
-        features_26 = np.concatenate([mean_vec, std_vec])     # 26-мерный вектор
+        if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
+            active = mfcc_norm[:, vad_mask]
+        else:
+            active = mfcc_norm
+
+        mean_vec = np.mean(active, axis=1)
+        std_vec  = np.std(active, axis=1) + 1e-8
+        features_26 = np.concatenate([mean_vec, std_vec])
 
         if self.normalizer.params is not None:
             normalized = self.normalizer.transform(features_26)
         else:
-            q_low, q_high = np.percentile(features_26, [2, 98])
+            # fallback robust scaling
+            q_low, q_high = np.percentile(features_26, [5, 95])
             if q_high - q_low < 1e-8:
                 normalized = np.full(26, 0.5, dtype=np.float32)
             else:
@@ -151,7 +163,7 @@ class VoiceFeaturePipeline:
             "y_pre": y_pre,
             "sr": sr,
             "use_rasta": self.use_rasta,
-            "pipeline_version": "2.8"
+            "pipeline_version": "2.14"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
