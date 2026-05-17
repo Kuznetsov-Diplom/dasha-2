@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Voice Feature Pipeline v2.23
+Dasha v2 — Voice Feature Pipeline v2.24
 
-- 26-dim (по умолчанию): 13 MFCC mean + 13 std (RASTA + per-utterance CMVN)
-- Опционально: + Delta + Delta-Delta → 39-dim
-- Полностью соответствует эксперименту v2.19 (26-dim — лучший по intra-correlation ~0.97)
-- Готово к НПБК по ГОСТ Р 52633.5
+- RASTA по умолчанию ВЫКЛЮЧЕН (use_rasta=False)
+- 26-dim или 39-dim (+Δ+ΔΔ)
+- per-utterance CMVN всегда включен
+- Готов к экспериментам и НПБК
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = True, use_deltas: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, vad_threshold: float = 0.01, normalizer: Optional[FeatureNormalizer] = None):
         self.use_rasta = use_rasta
         self.use_deltas = use_deltas
         self.vad_threshold = vad_threshold
@@ -141,7 +141,6 @@ class VoiceFeaturePipeline:
         std_vec  = np.std(active, axis=1) + 1e-8
 
         if self.use_deltas:
-            # Дельты после RASTA+CMVN (39-dim)
             delta1 = librosa.feature.delta(active, order=1, axis=1)
             delta2 = librosa.feature.delta(active, order=2, axis=1)
             mean_d1 = np.mean(delta1, axis=1)
@@ -168,7 +167,7 @@ class VoiceFeaturePipeline:
             "use_deltas": self.use_deltas,
             "dim": len(features),
             "dim_label": dim_label,
-            "pipeline_version": "2.23 (26/39-dim, RASTA+CMVN+Delta optional)"
+            "pipeline_version": "2.24 (RASTA=OFF by default, 26/39-dim)"
         }
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
@@ -192,6 +191,6 @@ class VoiceFeaturePipeline:
         }
 
 
-def process_phrase(audio_path: str | Path, use_rasta: bool = True, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
+def process_phrase(audio_path: str | Path, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None) -> Dict[str, Any]:
     pipeline = VoiceFeaturePipeline(use_rasta=use_rasta, use_deltas=use_deltas, normalizer=normalizer)
     return pipeline.extract_features(audio_path)

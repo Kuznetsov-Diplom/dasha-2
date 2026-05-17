@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.23
+Dasha v2 — Gradio интерфейс v2.24
 
-- 26-dim (default) или 39-dim (+Δ+ΔΔ)
-- Все графики обновляются надёжно
-- Готово к НПБК по ГОСТ Р 52633.5
+- RASTA выключен по умолчанию (лучшая разделимость)
+- 26-dim или 39-dim
+- Готов к экспериментам без RASTA
 """
 import gradio as gr
 import numpy as np
@@ -18,7 +18,7 @@ from pipeline import VoiceFeaturePipeline
 from normalizer import FeatureNormalizer
 from cv_ru_loader import load_speakers_with_audio
 
-pipeline = VoiceFeaturePipeline(use_rasta=True, use_deltas=False)
+pipeline = VoiceFeaturePipeline(use_rasta=False, use_deltas=False)
 normalizer = FeatureNormalizer(method="standard")
 
 global_speakers = {}
@@ -49,7 +49,7 @@ def _collect_real_vectors(max_vecs: int = 2000, use_deltas: bool = False):
     for speaker_id, audio_paths in sorted_sp:
         for path in audio_paths[:12]:
             try:
-                res = pipeline.extract_features(path)  # pipeline уже с use_deltas
+                res = pipeline.extract_features(path)
                 vecs.append(res["normalized_vector"])
                 if len(vecs) >= max_vecs:
                     return vecs
@@ -63,7 +63,7 @@ if real_vecs:
     normalizer.fit(arr)
     normalizer.save()
     pipeline.normalizer = normalizer
-    print(f"✅ Нормализатор обучен на {len(real_vecs)} векторах (26-dim)")
+    print(f"✅ Нормализатор обучен на {len(real_vecs)} векторах (26-dim, RASTA=OFF)")
 
 def create_waveform_plot(y: np.ndarray, sr: int, title: str = " waveform") -> go.Figure:
     time = np.linspace(0, len(y) / sr, len(y))
@@ -150,7 +150,7 @@ def process_correlation(mode, files, use_rasta, use_deltas, speaker_id=None):
         fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=v, mode="lines+markers", name=labels[i], line=dict(width=1.5), opacity=0.7))
     fig_lines.add_trace(go.Scatter(x=list(range(len(v))), y=mean_vec, mode="lines", name="Средний эталон", line=dict(color="black", width=3, dash="dash")))
     fig_lines.update_layout(title="Векторы vs Средний эталон", height=320, template="plotly_white")
-    md = f"**{len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}** | { '39-dim' if use_deltas else '26-dim' }"
+    md = f"**{len(vectors)} записей** | Средняя корреляция: **{np.mean(np.corrcoef(arr)):.3f}** | { '39-dim' if use_deltas else '26-dim' } | RASTA={'ON' if use_rasta else 'OFF'}"
     return md, fig_corr, fig_lines
 
 def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta, use_deltas):
@@ -190,15 +190,15 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta, use_deltas)
                 inter_sims.append(sim)
     mean_intra = float(np.mean(intra_sims)) if intra_sims else 0.0
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
-    rms_str = ", ".join([f"{r:.3f}" for r in speaker_rms])
     dim_label = "39-dim" if use_deltas else "26-dim"
-    md = f"**{dim_label}** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f}"
+    md = f"**{dim_label}** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f} | RASTA={'ON' if use_rasta else 'OFF'}"
     unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
     fig_heat = create_correlation_heatmap(speaker_means, unique_labels)
     fig_lines = go.Figure()
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    x_range = list(range(26 if not use_deltas else 39))
     for s in range(len(speaker_means)):
-        fig_lines.add_trace(go.Scatter(x=list(range(26 if not use_deltas else 39)), y=speaker_means[s], mode="lines+markers", name=f"Спикер {s+1} (RMS={speaker_rms[s]:.3f})", line=dict(width=2.5, color=colors[s % len(colors)]), marker=dict(size=5)))
+        fig_lines.add_trace(go.Scatter(x=x_range, y=speaker_means[s], mode="lines+markers", name=f"Спикер {s+1} (RMS={speaker_rms[s]:.3f})", line=dict(width=2.5, color=colors[s % len(colors)]), marker=dict(size=5)))
     fig_lines.update_layout(title=f"Средние векторы ({len(speaker_means)}) | {dim_label}", height=320, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     return md, fig_heat, fig_lines
 
@@ -213,13 +213,13 @@ def train_normalizer(max_speakers, phrases, use_deltas=False):
     normalizer.save()
     pipeline.normalizer = normalizer
     dim = 39 if use_deltas else 26
-    return f"✅ Нормализатор переобучен на {len(real_vecs)} векторах ({dim}-dim)."
+    return f"✅ Нормализатор переобучен на {len(real_vecs)} векторах ({dim}-dim, RASTA=OFF)."
 
-with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") as demo:
+with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК (RASTA=OFF)") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.23 — 26-dim (default) или 39-dim (+Δ+ΔΔ) | два режима**  
-    Готово к нормализации и НПБК по ГОСТ Р 52633.5.
+    **v2.24 — RASTA выключен по умолчанию** (лучшая разделимость спикеров)  
+    26-dim или 39-dim (+Δ+ΔΔ) | два режима
     """)
 
     with gr.Tabs():
@@ -233,7 +233,7 @@ with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") 
                     with gr.Group(visible=False) as dataset_group:
                         speaker_dd = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
                         btn_random = gr.Button("🎲 Случайный спикер", size="sm")
-                    use_rasta_cb = gr.Checkbox(value=True, label="RASTA + CMVN")
+                    use_rasta_cb = gr.Checkbox(value=False, label="RASTA (recommends OFF for better separation)")
                     use_deltas_cb = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
                     btn_process = gr.Button("🚀 Извлечь вектор", variant="primary")
                 with gr.Column(scale=2):
@@ -260,7 +260,7 @@ with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") 
                     with gr.Group(visible=False) as dataset_group2:
                         speaker_dd2 = gr.Dropdown(choices=speaker_list, label="Выбери спикера")
                         btn_random2 = gr.Button("🎲 Загрузить 10 фраз случайного спикера", size="sm")
-                    use_rasta2 = gr.Checkbox(value=True, label="RASTA")
+                    use_rasta2 = gr.Checkbox(value=False, label="RASTA (OFF recommended)")
                     use_deltas2 = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
                     btn_corr = gr.Button("Построить корреляцию и эталон", variant="primary")
                 with gr.Column(scale=2):
@@ -278,10 +278,10 @@ with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") 
         with gr.TabItem("3. Массовый тест + Research"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Параметры теста (26/39-dim)")
+                    gr.Markdown("### Параметры теста (26/39-dim, RASTA=OFF recommended)")
                     num_sp = gr.Slider(2, 12, value=8, step=1, label="Количество спикеров")
                     ph_per = gr.Slider(3, 15, value=8, step=1, label="Фраз на спикера")
-                    use_rasta3 = gr.Checkbox(value=True, label="RASTA")
+                    use_rasta3 = gr.Checkbox(value=False, label="RASTA (OFF = better inter-speaker separation)")
                     use_deltas3 = gr.Checkbox(value=False, label="+Δ + ΔΔ (39-dim)")
                     btn_test = gr.Button("Запустить тест ГОСТ", variant="primary")
                 with gr.Column(scale=2):
@@ -305,13 +305,13 @@ with gr.Blocks(title="Dasha v2 — 26/39-мерный вектор + НПБК") 
         with gr.TabItem("5. НПБК (в разработке)"):
             gr.Markdown("""
             ### Нейросетевой преобразователь «биометрия-код» (ГОСТ Р 52633.5)
-            **Текущий статус:** 26/39-мерный вектор готов к подаче на вход двухслойной нейросети.
+            **Текущий статус:** 26/39-мерный вектор (RASTA=OFF) готов к подаче.
             """)
             gr.Button("Сгенерировать ключ (заглушка)", interactive=False)
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.23** — 26-dim (default) / 39-dim (+Δ+ΔΔ) | два режима ввода | 2808 спикеров | Май 2026.
+    **Dasha v2 v2.24** — RASTA=OFF (default) | 26/39-dim | два режима ввода | 2808 спикеров | Май 2026.
     """)
 
 if __name__ == "__main__":
