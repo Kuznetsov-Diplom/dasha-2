@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2 — Gradio интерфейс v2.21
+Dasha v2 — Gradio интерфейс v2.22
 
-- 26-мерный вектор (MFCC only) — победитель
-- Вкладки 1 и 2: два режима — "Своя запись" и "Из датасета"
-- Готово к нормализации и НПБК
+- Исправлена ошибка выходов в массовом тесте (4 значения возвращалось, а outputs=3)
+- Это могло приводить к нестабильному обновлению графиков и "прыжкам" к первому графику
+- Все графики теперь обновляются корректно и независимо
+- Улучшена стабильность интерфейса
 """
 import gradio as gr
 import numpy as np
@@ -154,7 +155,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     global pipeline, global_speakers
     pipeline.use_rasta = use_rasta
     if not global_speakers:
-        return "❌ Датасет не загружен.", None, None, ""
+        return "❌ Датасет не загружен.", None, None
     sorted_speakers = sorted(global_speakers.items(), key=lambda x: len(x[1]), reverse=True)[:num_speakers]
     actual_num = len(sorted_speakers)
     all_vectors, speaker_labels, speaker_means, speaker_rms = [], [], [], []
@@ -174,7 +175,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
             rms = float(np.sqrt(np.mean(np.square(mean_vec))))
             speaker_rms.append(rms)
     if len(all_vectors) < 4:
-        return "❌ Мало данных.", None, None, ""
+        return "❌ Мало данных.", None, None
     intra_sims, inter_sims = [], []
     arr = np.array(all_vectors)
     for i in range(len(arr)):
@@ -186,7 +187,6 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
                 inter_sims.append(sim)
     mean_intra = float(np.mean(intra_sims)) if intra_sims else 0.0
     mean_inter = float(np.mean(inter_sims)) if inter_sims else 0.0
-    eer_proxy = max(0, (mean_inter - mean_intra) / (mean_intra + 1e-8) * 100)
     rms_str = ", ".join([f"{r:.3f}" for r in speaker_rms])
     md = f"**26-мерный вектор** | Спикеров: {actual_num} | Фраз: {len(all_vectors)} | intra: {mean_intra:.4f} | inter: {mean_inter:.4f}"
     unique_labels = [f"Спикер {s+1}" for s in range(len(speaker_means))]
@@ -196,7 +196,7 @@ def run_gost_mass_test(num_speakers, phrases_per_speaker, use_rasta):
     for s in range(len(speaker_means)):
         fig_lines.add_trace(go.Scatter(x=list(range(26)), y=speaker_means[s], mode="lines+markers", name=f"Спикер {s+1} (RMS={speaker_rms[s]:.3f})", line=dict(width=2.5, color=colors[s % len(colors)]), marker=dict(size=5)))
     fig_lines.update_layout(title=f"Средние векторы ({len(speaker_means)})", height=320, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    return md, fig_heat, fig_lines, "Реальные данные + 26-dim"
+    return md, fig_heat, fig_lines  # ИСПРАВЛЕНО: теперь ровно 3 значения под outputs
 
 def train_normalizer(max_speakers, phrases):
     global normalizer, pipeline, global_speakers
@@ -213,7 +213,7 @@ def train_normalizer(max_speakers, phrases):
 with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победитель) + НПБК") as demo:
     gr.Markdown("""
     # 🎤 Dasha v2 — Система биометрической генерации ключей по голосу
-    **v2.21 — 26-мерный вектор (MFCC only) | два режима: Своя запись / Из датасета**  
+    **v2.22 — 26-мерный вектор (MFCC only) | два режима: Своя запись / Из датасета**  
     Готово к нормализации и НПБК по ГОСТ Р 52633.5.
     """)
 
@@ -302,7 +302,7 @@ with gr.Blocks(title="Dasha v2 — 26-мерный вектор (победит�
 
     gr.Markdown("""
     ---
-    **Dasha v2 v2.21** — 26-мерный вектор (победитель) | два режима ввода | 2808 спикеров | Май 2026.
+    **Dasha v2 v2.22** — 26-мерный вектор (победитель) | два режима ввода | 2808 спикеров | Май 2026.
     """)
 
 if __name__ == "__main__":
