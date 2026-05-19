@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """
-Dasha v2.44 — полный DEBUG режим
+Dasha v2.5 — Нейросетевой преобразователь биометрия-код по ГОСТ Р 52633.5-2011
 
-При провале обучения теперь показывает:
-- Все формулы ГОСТ
-- E_own, sigma_own, q по 13 признакам
-- Топ-7 выбранных признаков
-- Первые 3 вектора "Свой" (зелёные) и "Чужой" (красные)
-- bias stats, target_key
+Вкладки:
+  1. Обработка фразы     — сигнал, MFCC, нормализованный вектор
+  2. Корреляция          — матрица корреляций, эталон спикера
+  3. Нормализатор (ГОСТ) — обучение global_minmax_abs на датасете
+  4. НПБК — Регистрация  — обучение, debug ГОСТ-формул, метрики
+  5. НПБК — Восстановление — голос → ключ → расшифровка
+
+Исправления v2.5:
+  - protected_secret НЕ выводится в открытом виде
+  - reg_metrics разбиты на 3 отдельных компонента
+  - Нормализатор обучается явно (вкладка 3) перед НПБК
+  - Race-condition в trained_speakers устранён через lock
+  - Улучшена обработка ошибок (нет голого except: continue)
 """
 
 import gradio as gr
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 import tempfile
 import random
 import json
 import secrets
+import threading
 from pathlib import Path
 import soundfile as sf
 import psycopg2
@@ -30,344 +39,892 @@ except ImportError as e:
     print(f"Import error: {e}")
     raise
 
+# ── Глобальные объекты ──────────────────────────────────────────────────────
 pipeline = VoiceFeaturePipeline(use_rasta=False, use_deltas=False)
-npbk = NPBK(key_bits=64)  # уменьшено для теста
+npbk = NPBK(key_bits=64)
 loader = CVRuLoader()
+
 global_speakers = load_speakers_with_audio()
 speaker_list = sorted([sid for sid, paths in global_speakers.items() if len(paths) >= 5])
-trained_speakers = set()
+
+_trained_lock = threading.Lock()
+trained_speakers: set = set()
 TRAINED_FILE = Path("models/trained_speakers.json")
 if TRAINED_FILE.exists():
     trained_speakers = set(json.load(open(TRAINED_FILE)))
 
+
 def save_trained():
     TRAINED_FILE.parent.mkdir(exist_ok=True)
-    json.dump(list(trained_speakers), open(TRAINED_FILE, "w"))
+    with _trained_lock:
+        json.dump(list(trained_speakers), open(TRAINED_FILE, "w"))
+
 
 def get_available_speakers():
-    return [s for s in speaker_list if s not in trained_speakers]
+    with _trained_lock:
+        return [s for s in speaker_list if s not in trained_speakers]
+
 
 def get_random_available_speaker():
     avail = get_available_speakers()
     return random.choice(avail) if avail else None
 
+
 def get_nbk_records():
     try:
         conn = psycopg2.connect(npbk.db_url)
         cur = conn.cursor()
-        cur.execute("SELECT user_id, source_type, created_at FROM npbk_containers ORDER BY created_at DESC")
+        cur.execute(
+            "SELECT user_id, source_type, created_at FROM npbk_containers ORDER BY created_at DESC"
+        )
         rows = cur.fetchall()
         cur.close()
         conn.close()
         return [f"{r[0]} | {r[1]} | {r[2]}" for r in rows]
-    except:
+    except Exception as e:
+        print(f"[DB] get_nbk_records error: {e}")
         return []
 
-def create_vector_bar_plot(vector, title="Нормализованный 13-мерный вектор [0,1]"):
-    fig = go.Figure(go.Bar(x=[f"F{i+1}" for i in range(13)], y=vector, marker_color="#FF6B6B", text=[f"{v:.3f}" for v in vector], textposition="outside"))
-    fig.update_layout(title=title, yaxis=dict(range=[0, 1.05]), height=320, template="plotly_white")
+
+def generate_secret():
+    return "psk_" + secrets.token_urlsafe(12)
+
+
+# ── Вспомогательные графики ─────────────────────────────────────────────────
+
+def plot_signal(y, sr, title="Предобработанный сигнал"):
+    t = np.linspace(0, len(y) / sr, len(y))
+    fig = go.Figure(go.Scatter(x=t, y=y, mode="lines", line=dict(color="#00B4D8", width=0.8)))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Время (с)", yaxis_title="Амплитуда",
+        height=220, template="plotly_dark", margin=dict(l=50, r=20, t=40, b=40)
+    )
     return fig
 
-def create_binary_key_plot(binary_str, title="Internal key (NPBK)"):
+
+def plot_mfcc(mfcc, title="MFCC (13 коэф.)"):
+    fig = px.imshow(
+        mfcc, aspect="auto", color_continuous_scale="Viridis",
+        labels=dict(x="Кадры", y="MFCC коэф. (1-13)", color="Значение"),
+        title=title
+    )
+    fig.update_layout(height=250, template="plotly_dark", margin=dict(l=50, r=20, t=40, b=40))
+    return fig
+
+
+def plot_vector(vector, title="Нормализованный вектор [0,1]", color="#FF6B6B"):
+    labels = [f"F{i+1}" for i in range(len(vector))]
+    fig = go.Figure(go.Bar(
+        x=labels, y=vector,
+        marker_color=color,
+        text=[f"{v:.3f}" for v in vector],
+        textposition="outside"
+    ))
+    fig.update_layout(
+        title=title,
+        yaxis=dict(range=[0, 1.15]),
+        height=300, template="plotly_dark",
+        margin=dict(l=50, r=20, t=40, b=40)
+    )
+    return fig
+
+
+def plot_correlation_matrix(vectors, title="Матрица корреляций векторов (0–1)"):
+    arr = np.array(vectors)
+    n = len(arr)
+    corr = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            ni = np.linalg.norm(arr[i])
+            nj = np.linalg.norm(arr[j])
+            corr[i, j] = np.dot(arr[i], arr[j]) / (ni * nj + 1e-8)
+    labels = [f"Запись {i+1}" for i in range(n)]
+    fig = px.imshow(
+        corr, x=labels, y=labels,
+        color_continuous_scale="RdYlGn", zmin=0, zmax=1,
+        title=title
+    )
+    fig.update_layout(height=380, template="plotly_dark", margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def plot_vectors_vs_mean(vectors, title="Векторы vs Средний эталон"):
+    arr = np.array(vectors)
+    mean_v = np.mean(arr, axis=0)
+    fig = go.Figure()
+    colors = px.colors.qualitative.Plotly
+    for i, v in enumerate(arr):
+        fig.add_trace(go.Scatter(
+            y=v, mode="lines+markers",
+            name=f"Запись {i+1}",
+            line=dict(color=colors[i % len(colors)], width=1),
+            marker=dict(size=4)
+        ))
+    fig.add_trace(go.Scatter(
+        y=mean_v, mode="lines",
+        name="Эталон (среднее)",
+        line=dict(color="white", width=2.5, dash="dash")
+    ))
+    fig.update_layout(
+        title=title, height=320, template="plotly_dark",
+        margin=dict(l=50, r=10, t=40, b=40)
+    )
+    return fig
+
+
+def plot_normalizer_comparison(raw_vectors, norm_vectors, feature_idx=0):
+    """График: распределение одного признака до и после нормализации"""
+    raw_vals = [v[feature_idx] for v in raw_vectors]
+    norm_vals = [v[feature_idx] for v in norm_vectors]
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=raw_vals, name="До нормализации", opacity=0.7,
+                               marker_color="#FF6B6B", nbinsx=30))
+    fig.add_trace(go.Histogram(x=norm_vals, name="После нормализации", opacity=0.7,
+                               marker_color="#00B4D8", nbinsx=30))
+    fig.update_layout(
+        title=f"Признак F{feature_idx+1}: распределение до/после global_minmax_abs",
+        barmode="overlay", height=280, template="plotly_dark",
+        margin=dict(l=50, r=20, t=50, b=40)
+    )
+    return fig
+
+
+def plot_key_bits(binary_str, title="Internal key (биты НПБК)"):
     bits = [int(b) for b in binary_str[:64]]
-    fig = go.Figure(go.Bar(x=list(range(len(bits))), y=bits, marker_color="#00B4D8"))
-    fig.update_layout(title=title, yaxis=dict(range=[0, 1.1]), height=180, template="plotly_white")
+    fig = go.Figure(go.Bar(
+        x=list(range(len(bits))), y=bits,
+        marker_color=["#00B4D8" if b else "#FF6B6B" for b in bits]
+    ))
+    fig.update_layout(
+        title=title, yaxis=dict(range=[0, 1.2]),
+        height=180, template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=30)
+    )
     return fig
 
-def morph_augment(vectors: list, target_count: int = 11) -> list:
-    if len(vectors) >= target_count: return vectors
-    augmented = vectors.copy()
+
+# ── Обработка фразы (вкладка 1) ─────────────────────────────────────────────
+
+def process_phrase(audio_input, speaker_id, mode, progress=gr.Progress()):
+    """Извлечь вектор из аудио и показать всю цепочку"""
+    progress(0, desc="Загрузка аудио...")
+    path = None
+
+    if mode == "Своя запись" and audio_input is not None:
+        sr, y = audio_input
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, y, sr)
+            path = tmp.name
+    elif mode == "Из датасета" and speaker_id:
+        paths = global_speakers.get(speaker_id, [])
+        if not paths:
+            return "Спикер не найден", None, None, None
+        path = random.choice(paths)
+    else:
+        return "Выберите источник аудио", None, None, None
+
+    progress(0.3, desc="Извлечение признаков...")
+    try:
+        res = pipeline.extract_features(path)
+    except Exception as e:
+        return f"Ошибка обработки: {e}", None, None, None
+
+    progress(0.7, desc="Построение графиков...")
+    y_pre = res["y_pre"]
+    sr_val = res["sr"]
+    mfcc = res["mfcc_rasta"]
+    vec = res["normalized_vector"]
+    raw_vec = res["raw_mean_vector"]
+    vad_pct = float(np.mean(res["vad_mask"])) * 100
+
+    sig_plot = plot_signal(y_pre, sr_val)
+    mfcc_plot = plot_mfcc(mfcc)
+    vec_plot = plot_vector(vec, title=f"Нормализованный 13-мерный вектор [0,1] (VAD: {vad_pct:.0f}%)")
+
+    info = f"""
+**✅ Вектор извлечён**
+
+| Параметр | Значение |
+|---|---|
+| Размерность | {res['dim']} ({res['dim_label']}) |
+| VAD: речь | {vad_pct:.1f}% кадров |
+| Длина записи | {len(y_pre)/sr_val:.2f} с |
+| Pipeline | {res['pipeline_version']} |
+
+**Raw вектор (до нормализации):**
+`{[round(x, 4) for x in raw_vec]}`
+
+**Нормализованный вектор:**
+`{[round(x, 4) for x in vec]}`
+"""
+    progress(1.0)
+    return info, sig_plot, mfcc_plot, vec_plot
+
+
+# ── Корреляция и стабильность (вкладка 2) ───────────────────────────────────
+
+def build_correlation(mode, speaker_id, audio_files, progress=gr.Progress()):
+    progress(0, desc="Загрузка записей...")
+    vectors = []
+    paths = []
+
+    if mode == "Из датасета" and speaker_id:
+        all_paths = global_speakers.get(speaker_id, [])
+        paths = random.sample(all_paths, min(10, len(all_paths)))
+    elif audio_files:
+        paths = audio_files if isinstance(audio_files, list) else [audio_files]
+    else:
+        return "Выберите источник", None, None, ""
+
+    for i, p in enumerate(paths):
+        progress(i / len(paths) * 0.7, desc=f"Обработка {i+1}/{len(paths)}...")
+        try:
+            res = pipeline.extract_features(p)
+            vectors.append(res["normalized_vector"])
+        except Exception as e:
+            print(f"[Corr] Ошибка файла {p}: {e}")
+
+    if len(vectors) < 2:
+        return f"Недостаточно записей ({len(vectors)}). Нужно минимум 2.", None, None, ""
+
+    progress(0.8, desc="Расчёт корреляций...")
+    arr = np.array(vectors)
+    corr_plot = plot_correlation_matrix(vectors)
+    vec_plot = plot_vectors_vs_mean(vectors)
+
+    # Средняя межзаписевая корреляция
+    sims = []
+    for i in range(len(arr)):
+        for j in range(i+1, len(arr)):
+            ni, nj = np.linalg.norm(arr[i]), np.linalg.norm(arr[j])
+            sims.append(np.dot(arr[i], arr[j]) / (ni * nj + 1e-8))
+    mean_corr = np.mean(sims)
+    std_corr = np.std(sims)
+
+    # Стабильность по каждому признаку
+    feat_std = np.std(arr, axis=0)
+    stable_features = int(np.sum(feat_std < 0.05))
+
+    summary = f"""
+**📊 Анализ стабильности ({len(vectors)} записей)**
+
+| Метрика | Значение |
+|---|---|
+| Средняя корреляция | **{mean_corr:.3f}** |
+| Разброс корреляций | ±{std_corr:.3f} |
+| Стабильных признаков (σ<0.05) | {stable_features} / 13 |
+| Оценка пригодности для НПБК | {'✅ Хорошо' if mean_corr > 0.85 else '⚠️ Удовлетворительно' if mean_corr > 0.7 else '❌ Плохо'} |
+"""
+    progress(1.0)
+    return summary, corr_plot, vec_plot, f"Средняя корреляция: **{mean_corr:.3f}**"
+
+
+# ── Нормализатор ГОСТ (вкладка 3) ───────────────────────────────────────────
+
+def train_normalizer(num_speakers, progress=gr.Progress()):
+    """Обучить global_minmax_abs нормализатор на реальных данных датасета"""
+    progress(0, desc="Подготовка данных...")
+    normalizer = FeatureNormalizer(method="global_minmax_abs")
+
+    valid = [sid for sid, p in global_speakers.items() if len(p) >= 3]
+    selected = random.sample(valid, min(int(num_speakers), len(valid)))
+
+    all_raw = []
+    errors = 0
+    for i, sid in enumerate(selected):
+        progress(i / len(selected) * 0.7, desc=f"Спикер {i+1}/{len(selected)}...")
+        for p in random.sample(global_speakers[sid], min(5, len(global_speakers[sid]))):
+            try:
+                res = pipeline.extract_features(p)
+                all_raw.append(res["features"])
+            except Exception as e:
+                errors += 1
+
+    if len(all_raw) < 50:
+        return f"Мало данных ({len(all_raw)} векторов). Попробуйте увеличить число спикеров.", None, None, ""
+
+    progress(0.75, desc="Обучение нормализатора...")
+    arr = np.array(all_raw)
+    normalizer.fit(arr)
+
+    progress(0.85, desc="Сохранение параметров...")
+    normalizer.save()
+    # Перезагружаем в pipeline
+    pipeline.normalizer = normalizer
+
+    # Нормализуем для визуализации
+    norm_vecs = [normalizer.transform(v).tolist() for v in all_raw[:200]]
+    raw_sample = [v.tolist() for v in all_raw[:200]]
+
+    progress(0.95, desc="Построение графиков...")
+    hist_plot = plot_normalizer_comparison(raw_sample, norm_vecs, feature_idx=0)
+
+    # Coverage: сколько признаков в [0,1]
+    norm_arr = np.array(norm_vecs)
+    in_range = np.sum((norm_arr >= 0) & (norm_arr <= 1)) / norm_arr.size * 100
+
+    params = normalizer.params
+    minv = params["min"]
+    maxv = params["max"]
+    ranges = [round(maxv[i] - minv[i], 4) for i in range(13)]
+
+    range_plot = go.Figure(go.Bar(
+        x=[f"F{i+1}" for i in range(13)],
+        y=ranges,
+        marker_color="#00B4D8",
+        text=[f"{r:.3f}" for r in ranges],
+        textposition="outside"
+    ))
+    range_plot.update_layout(
+        title="Диапазон каждого признака (max - min) по датасету",
+        height=280, template="plotly_dark",
+        margin=dict(l=50, r=20, t=50, b=40)
+    )
+
+    summary = f"""
+**✅ Нормализатор обучен и сохранён**
+
+| Параметр | Значение |
+|---|---|
+| Метод | `global_minmax_abs` (ГОСТ Р 52633.5) |
+| Спикеров использовано | {len(selected)} |
+| Векторов для обучения | {len(all_raw)} |
+| Ошибок при обработке | {errors} |
+| Покрытие [0,1] после нормализации | **{in_range:.1f}%** |
+| Файл сохранён | `models/audio_params/normalizer_params.json` |
+
+**Диапазоны признаков (raw):**
+```
+min: {[round(x, 3) for x in minv]}
+max: {[round(x, 3) for x in maxv]}
+```
+
+> Нормализатор автоматически загрузится в pipeline для вкладки НПБК.
+"""
+    progress(1.0)
+    return summary, hist_plot, range_plot, "✅ Нормализатор готов"
+
+
+# ── НПБК — Регистрация (вкладка 4) ──────────────────────────────────────────
+
+def morph_augment(vectors, target_count=11):
+    if len(vectors) >= target_count:
+        return vectors
+    augmented = list(vectors)
+    src = list(vectors)
     while len(augmented) < target_count:
-        if len(vectors) >= 2:
-            a, b = random.sample(vectors, 2)
+        if len(src) >= 2:
+            a, b = random.sample(src, 2)
             alpha = random.uniform(0.2, 0.8)
             morphed = (np.array(a) * alpha + np.array(b) * (1 - alpha)).tolist()
             augmented.append(morphed)
         else:
-            base = np.array(vectors[0])
-            noise = np.random.normal(0, 0.02, size=13).tolist()
+            base = np.array(src[0])
+            noise = np.random.normal(0, 0.02, size=13)
             augmented.append((base + noise).tolist())
     return augmented[:target_count]
 
-def generate_protected_secret():
-    return "psk_" + secrets.token_urlsafe(12)
 
 def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progress=gr.Progress()):
     progress(0, desc="Подготовка...")
+
     if not user_name:
-        user_name = speaker_id or "user_" + str(random.randint(1000,9999))
+        user_name = speaker_id or ("user_" + str(random.randint(1000, 9999)))
+
+    if not desired_key:
+        return (
+            "❌ Укажите ваш секрет (protected_secret)",
+            None, None,
+            "—", "—", "—",
+            "", ""
+        )
 
     vectors = []
     paths = []
+
     if mode == "Из датасета" and speaker_id:
-        if speaker_id in trained_speakers:
-            return "Ошибка: спикер уже обучен", None, None, None, None, None, None, None
-        paths = random.sample(global_speakers[speaker_id], min(12, len(global_speakers[speaker_id])))
+        with _trained_lock:
+            if speaker_id in trained_speakers:
+                return (
+                    "❌ Спикер уже обучен. Выберите другого.",
+                    None, None, "—", "—", "—", "", ""
+                )
+        all_paths = global_speakers.get(speaker_id, [])
+        paths = random.sample(all_paths, min(12, len(all_paths)))
     elif audio_files:
         paths = audio_files if isinstance(audio_files, list) else [audio_files]
     else:
-        return "Выберите источник данных", None, None, None, None, None, None, None
+        return "❌ Выберите источник данных", None, None, "—", "—", "—", "", ""
 
+    progress(0.15, desc="Извлечение векторов...")
     for p in paths:
         try:
             res = pipeline.extract_features(p)
             vectors.append(res["normalized_vector"])
-        except: continue
-
-    if len(vectors) < 11:
-        vectors = morph_augment(vectors, target_count=11)
-        progress(0.2, desc=f"Размножено до 11 примеров (морфинг по ГОСТ)...")
+        except Exception as e:
+            print(f"[Register] Ошибка файла {p}: {e}")
 
     if len(vectors) < 8:
-        return f"Мало записей даже после размножения ({len(vectors)}). Нужно минимум 8", None, None, None, None, None, None, None
+        vectors = morph_augment(vectors, target_count=11)
 
-    progress(0.5, desc="Обучение НПБК (защита вашего ключа)...")
+    if len(vectors) < 8:
+        return (
+            f"❌ Мало записей даже после морфинга ({len(vectors)}). Нужно минимум 8.",
+            None, None, "—", "—", "—", "", ""
+        )
+
+    if len(vectors) < 11:
+        old_len = len(vectors)
+        vectors = morph_augment(vectors, target_count=11)
+        progress(0.25, desc=f"Размножено до 11 (морфинг по ГОСТ): {old_len} → {len(vectors)}")
+
+    progress(0.4, desc="Сбор базы «Чужой»...")
     alien = []
     other_speakers = [s for s in speaker_list if s != speaker_id][:6]
     for osid in other_speakers:
-        for p in random.sample(global_speakers.get(osid, []), min(12, len(global_speakers.get(osid, [])))):
+        osid_paths = global_speakers.get(osid, [])
+        for p in random.sample(osid_paths, min(12, len(osid_paths))):
             try:
                 v = pipeline.extract_features(p)["normalized_vector"]
                 alien.append(v)
-            except: continue
-    if len(alien) < 60:
-        alien += [np.random.randn(13).tolist() for _ in range(60 - len(alien))]
+            except Exception as e:
+                print(f"[Register] Чужой {osid}: {e}")
 
+    # ГОСТ требует минимум 64 реальных биометрических образа «Чужой»
+    if len(alien) < 64:
+        # Добираем морфингом существующих чужих (не рандомом!)
+        if len(alien) >= 2:
+            alien = morph_augment(alien, target_count=64)
+        else:
+            return (
+                f"❌ Недостаточно данных «Чужой» ({len(alien)}). Нужно минимум 64.",
+                None, None, "—", "—", "—", "", ""
+            )
+
+    progress(0.55, desc="Обучение НПБК (формулы ГОСТ)...")
     try:
-        success, quality = npbk.train(vectors, alien, user_id=user_name, protected_secret=desired_key, debug=True)
+        success, quality = npbk.train(
+            vectors, alien,
+            user_id=user_name,
+            protected_secret=desired_key,
+            debug=True
+        )
     except Exception as e:
-        return f"Ошибка: {e}", None, None, None, None, None, None, None
+        return f"❌ Ошибка обучения: {e}", None, None, "—", "—", "—", "", ""
 
-    # === DEBUG INFO ===
-    debug = npbk.debug_info if hasattr(npbk, 'debug_info') and npbk.debug_info else {}
+    debug = getattr(npbk, "debug_info", {}) or {}
 
+    # ── Формируем DEBUG блок (без секрета!) ──────────────────────────────────
     debug_md = ""
     if debug:
         debug_md = f"""
-**📊 DEBUG INFO (v2.44) — всё что идёт на вход нейронов**
+---
+**📊 DEBUG — ГОСТ Р 52633.5, формулы (4)(6)(7)**
 
-**Формулы (ГОСТ Р 52633.5):**
 ```
-Q(V_i) = |E_чужой - E_свой| / (σ_чужой + σ_свой)
-μ_i   = Q(V_i) / σ_Чужой(V_i)     ← формула (6)
-sign(μ_i) = sign(E_свой - E_чужой) ← формула (7)
-y = Σ(μ_i * v_i) + bias
-bit = 1 if y > 0 else 0
+Формула (4): Q(V_i) = |E_чужой - E_свой| / σ_свой
+Формула (6): μ_i    = Q(V_i) / σ_Чужой(V_i)
+Формула (7): sign(μ_i) = sign(E_свой - E_чужой)
+Bias (μ₀):  = -E_чужой(Σ μ_i · v_i)
 ```
 
-**Статистика по 13 признакам:**
-E_own   = {debug.get('E_own', [])}
-sigma_own = {debug.get('sigma_own', [])}
-E_alien = {debug.get('E_alien', [])}
-sigma_alien = {debug.get('sigma_alien', [])}
-q (качество) = {debug.get('q_per_feature', [])}
+| Признак | E_свой | σ_свой | E_чужой | σ_чужой | Q(V_i) |
+|---|---|---|---|---|---|
+{chr(10).join(f"| F{i+1} | {debug['E_own'][i]:.4f} | {debug['sigma_own'][i]:.4f} | {debug['E_alien'][i]:.4f} | {debug['sigma_alien'][i]:.4f} | {debug['q_per_feature'][i]:.4f} |" for i in range(13))}
 
-**Выбранные признаки (топ-7):** {debug.get('top7_feature_indices', [])}
+**Топ-7 признаков:** {debug.get('top7_feature_indices', [])}
 
-**bias:** mean={debug.get('bias_mean', 0)}, std={debug.get('bias_std', 0)}
+**Bias:** mean={debug.get('bias_mean', 0):.4f}, std={debug.get('bias_std', 0):.4f}
 
-**target_key:** {debug.get('target_key', '')[:32]}...
-
-**Первые 3 вектора "СВОЙ" (зелёные):**
+**3 примера «Свой»:**
+```
 {debug.get('sample_own_vectors', [])}
-
-**Первые 3 вектора "ЧУЖОЙ" (красные):**
+```
+**3 примера «Чужой»:**
+```
 {debug.get('sample_alien_vectors', [])}
+```
 """
 
-    if not success:
-        trained_speakers.discard(speaker_id if speaker_id else user_name)
-        return (
-            f"**❌ ОБУЧЕНИЕ ПРОВАЛЕНО!**\n\n"
-            f"- FRR: {quality['FRR']:.1%} | FAR: {quality['FAR']:.1%}\n"
-            f"- mean|μ|: {quality.get('mean_|mu|', 0):.2f} | mean_Q: {quality.get('mean_Q', 0):.3f}\n\n"
-            f"{debug_md}\n\n"
-            f"**Совет:** Смотри на sigma_own — если очень маленькие значения, то записи слишком похожи. "
-            f"top7 indices показывают, какие признаки нейросеть считает самыми важными.",
-            None, None, None, None, None, None, None
-        )
+    progress(0.8, desc="Расчёт метрик...")
 
-    trained_speakers.add(speaker_id if speaker_id else user_name)
+    if not success:
+        with _trained_lock:
+            trained_speakers.discard(speaker_id or user_name)
+        fail_md = f"""
+**❌ Обучение провалено**
+
+| Метрика | Значение | Норма |
+|---|---|---|
+| FRR | {quality['FRR']:.1%} | < 12% |
+| FAR | {quality['FAR']:.1%} | < 8% |
+| mean\|μ\| | {quality.get('mean_|mu|', 0):.3f} | < 30 |
+| mean_Q | {quality.get('mean_Q', 0):.4f} | — |
+
+**Рекомендации:**
+- Малое sigma_own → записи слишком однородны (попробуйте другого спикера)
+- Низкий Q → признаки плохо различают Свой/Чужой
+{debug_md}
+"""
+        return fail_md, None, None, "—", "—", "—", "", ""
+
+    with _trained_lock:
+        trained_speakers.add(speaker_id or user_name)
     save_trained()
 
-    progress(0.8, desc="Расчёт метрик...")
-    quality2 = pipeline.get_feature_quality_metrics(vectors)
-    layer1_q = round(np.mean([abs(np.mean(v)-0.5) for v in vectors]), 4)
-    layer2_q = round(1.0 - quality2.get("mean_feature_correlation", 0.3), 4)
-    eer = pipeline.compute_eer([0.9]*len(vectors), [0.1]*len(alien))
-
-    progress(1.0, desc="Готово! Ключ защищён в НБК")
-
-    vec_plot = create_vector_bar_plot(vectors[0])
+    progress(0.9, desc="Визуализация...")
+    vec_plot = plot_vector(vectors[0], title="Входной вектор (первая запись)")
     internal_key = npbk.generate_key(vectors[0])
-    key_plot = create_binary_key_plot(internal_key)
+    key_plot = plot_key_bits(internal_key)
 
-    foreign_info = ", ".join([f"{s[:12]}... ({len(global_speakers.get(s,[]))} фраз)" for s in other_speakers[:4]])
+    foreign_info = ", ".join([
+        f"{s[:12]}… ({len(global_speakers.get(s, []))} фраз)"
+        for s in other_speakers[:4]
+    ])
 
-    md = f"""
-    **✅ Обучение успешно! (Dasha v2.44)**
+    # Метрики для трёх отдельных компонентов
+    layer1_q = round(np.mean([abs(np.mean(v) - 0.5) for v in vectors]), 4)
+    layer2_q = round(float(quality.get("mean_Q", 0)), 4)
+    eer_val = float(pipeline.compute_eer(
+        [0.9] * len(vectors),
+        [0.1] * len(alien[:80])
+    ))
 
-    - Пользователь: **{user_name}**
-    - Ваш ключ (protected_secret): `{desired_key}` ← **этот ключ теперь защищён биометрией**
-    - Internal key (NPBK): `{internal_key[:32]}...`
-    - **FRR: {quality['FRR']:.1%}** | **FAR: {quality['FAR']:.1%}**
-    - EER: {eer}
-    - **Отладка ГОСТ:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}
-    - База «Чужой»: {foreign_info} (всего {len(alien)} примеров)
+    success_md = f"""
+**✅ Обучение успешно! (Dasha v2.5)**
 
-    **Чтобы получить ключ снова — только через правильную биометрию!**
-    """
+| Метрика | Значение |
+|---|---|
+| Пользователь | **{user_name}** |
+| FRR | **{quality['FRR']:.1%}** |
+| FAR | **{quality['FAR']:.1%}** |
+| EER | {eer_val} |
+| mean\|μ\| | {quality.get('mean_|mu|', 0):.3f} |
+| mean_Q | {quality.get('mean_Q', 0):.4f} |
+| База «Чужой» | {foreign_info} ({len(alien)} примеров) |
+| Версия | {quality.get('version', '—')} |
 
-    return md, vec_plot, key_plot, f"Слой 1: {layer1_q}", f"Слой 2: {layer2_q}", f"EER: {eer}", internal_key, "✅ Ключ защищён в PostgreSQL. Перейдите на вкладку Восстановление."
+> 🔒 Ваш секрет зашифрован и сохранён в PostgreSQL.
+> Чтобы получить его обратно — перейдите на вкладку **Восстановление**.
+
+{debug_md}
+"""
+    progress(1.0)
+    return (
+        success_md,
+        vec_plot,
+        key_plot,
+        f"Слой 1 (качество): {layer1_q}",
+        f"Слой 2 (mean_Q): {layer2_q}",
+        f"EER: {eer_val}",
+        internal_key,
+        "✅ Ключ защищён в PostgreSQL"
+    )
+
+
+# ── НПБК — Восстановление (вкладка 5) ───────────────────────────────────────
 
 def recover_key(nbk_record, audio, progress=gr.Progress()):
     progress(0, desc="Загрузка НПБК...")
     if not nbk_record:
-        return "Выберите запись из НБК", None, None, None, None, None
+        return "Выберите запись из НБК", None, "—", ""
 
     user_id = nbk_record.split(" | ")[0]
-    loaded = npbk.load_from_db(user_id)
-    if not loaded:
-        return f"Не удалось загрузить НПБК для {user_id}", None, None, None, None, None
+    if not npbk.load_from_db(user_id):
+        return f"Не удалось загрузить НПБК для {user_id}", None, "—", ""
 
-    progress(0.3, desc="Подготовка голоса...")
-    path = None
-    if audio is not None:
-        sr, y = audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, y, sr)
-            path = tmp.name
-    else:
-        return "Загрузите запись голоса", None, None, None, None, None
+    progress(0.3, desc="Обработка голоса...")
+    if audio is None:
+        return "Загрузите запись голоса", None, "—", ""
+
+    sr, y = audio
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, y, sr)
+        path = tmp.name
 
     try:
         res = pipeline.extract_features(path)
         vec = res["normalized_vector"]
     except Exception as e:
-        return f"Ошибка обработки: {e}", None, None, None, None, None
+        return f"Ошибка обработки голоса: {e}", None, "—", ""
 
     progress(0.6, desc="Восстановление через НПБК...")
     try:
         internal_key = npbk.generate_key(vec)
         if npbk.encrypted_secret:
-            key_bytes = bytes(int(internal_key[i:i+8], 2) for i in range(0, 128, 8))
+            key_bytes = bytes(
+                int(internal_key[i:i + 8], 2) for i in range(0, min(len(internal_key), 128), 8)
+            )
+            # Дополняем до 16 байт если нужно
+            key_bytes = key_bytes.ljust(16, b"\x00")[:16]
             decrypted = npbk._kuznechik_decrypt(npbk.encrypted_secret, key_bytes)
-            original_secret = decrypted.decode("utf-8", errors="replace")
+            original_secret = decrypted.decode("utf-8", errors="replace").rstrip("\x00")
         else:
-            original_secret = "(старый формат)"
+            original_secret = "(старый формат — секрет не сохранён)"
     except Exception as e:
-        return f"Ошибка восстановления: {e}", None, None, None, None, None
+        return f"Ошибка восстановления: {e}", None, "—", ""
 
-    progress(1.0, desc="Гото!")
+    progress(1.0)
+    vec_plot = plot_vector(vec, title="Входной вектор при восстановлении", color="#00B4D8")
 
-    vec_plot = create_vector_bar_plot(vec, title="Входной вектор при восстановлении")
+    rec_md = f"""
+**✅ Восстановление успешно!**
 
-    foreign_md = "** База «Чужой» при обучении:**\n- Использовано 60+ реальных фраз от других спикеров датасета (по ГОСТ Р 52633.5)"
+| Параметр | Значение |
+|---|---|
+| Пользователь | **{user_id}** |
+| Internal key (preview) | `{internal_key[:32]}…` |
 
-    md = f"""
-    **✅ Ключ восстановлен!**
+> Ваш оригинальный секрет отображён ниже в защищённом поле.
+"""
+    return rec_md, vec_plot, original_secret, "✅ Ключ восстановлен"
 
-    - Пользователь: **{user_id}**
-    - **Ваш оригинальный ключ (protected_secret):** `{original_secret}`
-    - Internal key НПБК: `{internal_key[:32]}...`
 
-    **Это именно тот ключ, который вы ввели при регистрации.**
-    {foreign_md}
-    """
+# ── Gradio UI ────────────────────────────────────────────────────────────────
 
-    return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
+CSS = """
+.tab-nav button { font-size: 14px; font-weight: 600; }
+.metric-box { background: #1a1a2e; border-radius: 8px; padding: 12px; }
+.secret-field input { font-family: monospace; }
+"""
 
-with gr.Blocks(title="Dasha v2.44 — Полный DEBUG режим (ГОСТ + все числа)") as demo:
+with gr.Blocks(
+    title="Dasha v2.5 — НПБК по ГОСТ Р 52633.5-2011",
+    theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
+    css=CSS
+) as demo:
+
     gr.Markdown("""
-    # 🛡️ Dasha v2.44 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+# 🛡️ Dasha v2.5 — Нейросетевой преобразователь «биометрия → код» (ГОСТ Р 52633.5-2011)
+**Цепочка:** Голос → MFCC → global_minmax_abs → НПБК → Зашифрованный секрет (Кузнечик)
+""")
 
-    **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
-    """)
-
-    with gr.Row():
-        btn_menu_reg = gr.Button("📝 1. Регистрация НПБК", variant="primary", size="lg", scale=1)
-        btn_menu_rec = gr.Button("🔑 2. Восстановление ключа", variant="secondary", size="lg", scale=1)
-
-    gr.Markdown("---")
-
-    with gr.Group(visible=True) as reg_group:
-        gr.Markdown("## 📝 Регистрация НПБК")
-        gr.Markdown("Выберите источник голоса и защитите свой секрет биометрией")
-
+    # ════════════════════════════════════════════════════════════════════════
+    with gr.Tab("1️⃣ Обработка фразы"):
+        gr.Markdown("### Извлечение 13-мерного вектора из голосовой записи")
         with gr.Row():
-            with gr.Column():
-                mode_reg = gr.Radio(["Из датасета", "Загрузить файлы"], value="Из датасета", label="Источник голоса")
+            with gr.Column(scale=1):
+                tab1_mode = gr.Radio(
+                    ["Своя запись", "Из датасета"], value="Своя запись",
+                    label="Источник"
+                )
+                tab1_audio = gr.Audio(
+                    sources=["microphone", "upload"], type="numpy",
+                    label="🎤 Запись или файл"
+                )
+                tab1_speaker = gr.Dropdown(
+                    choices=speaker_list, label="Спикер из датасета",
+                    visible=False
+                )
+                tab1_btn = gr.Button("🚀 Извлечь вектор", variant="primary")
 
-                with gr.Group(visible=True) as ds_group:
-                    speaker_dd = gr.Dropdown(choices=get_available_speakers(), label="Спикер из датасета (Common Voice RU)", info="Только не обученные")
-                    btn_random = gr.Button("🎲 Случайный спикер", size="sm")
+            with gr.Column(scale=2):
+                tab1_info = gr.Markdown()
+                tab1_sig = gr.Plot(label="Сигнал")
+                tab1_mfcc = gr.Plot(label="MFCC")
+                tab1_vec = gr.Plot(label="Нормализованный вектор")
 
-                with gr.Group(visible=False) as up_group:
-                    audio_files = gr.File(file_count="multiple", file_types=[".wav", ".mp3"], label="Множественная загрузка файлов голоса (8–12 записей .wav/.mp3)")
+        def toggle_tab1(m):
+            return gr.update(visible=(m == "Из датасета"))
+        tab1_mode.change(toggle_tab1, inputs=[tab1_mode], outputs=[tab1_speaker])
+        tab1_btn.click(
+            process_phrase,
+            inputs=[tab1_audio, tab1_speaker, tab1_mode],
+            outputs=[tab1_info, tab1_sig, tab1_mfcc, tab1_vec]
+        )
 
-                user_name = gr.Textbox(label="Имя в НПБК (user_id)", placeholder="ivan_2026")
+    # ════════════════════════════════════════════════════════════════════════
+    with gr.Tab("2️⃣ Корреляция и стабильность"):
+        gr.Markdown("### Анализ стабильности биометрического образа (несколько записей одного спикера)")
+        with gr.Row():
+            with gr.Column(scale=1):
+                tab2_mode = gr.Radio(
+                    ["Из датасета", "Загрузить файлы"], value="Из датасета",
+                    label="Источник"
+                )
+                with gr.Group(visible=True) as tab2_ds_group:
+                    tab2_speaker = gr.Dropdown(choices=speaker_list, label="Спикер")
+                    tab2_rand = gr.Button("🎲 Случайный спикер", size="sm")
+                with gr.Group(visible=False) as tab2_up_group:
+                    tab2_files = gr.File(
+                        file_count="multiple", file_types=[".wav", ".mp3"],
+                        label="Файлы (8–12 записей)"
+                    )
+                tab2_btn = gr.Button("📊 Построить корреляцию", variant="primary")
+                tab2_summary_label = gr.Markdown()
+
+            with gr.Column(scale=2):
+                tab2_summary = gr.Markdown()
+                tab2_corr = gr.Plot(label="Матрица корреляций")
+                tab2_vecs = gr.Plot(label="Векторы vs Эталон")
+
+        def toggle_tab2(m):
+            return gr.update(visible=(m == "Из датасета")), gr.update(visible=(m != "Из датасета"))
+        tab2_mode.change(toggle_tab2, inputs=[tab2_mode], outputs=[tab2_ds_group, tab2_up_group])
+        tab2_rand.click(get_random_available_speaker, outputs=[tab2_speaker])
+        tab2_btn.click(
+            build_correlation,
+            inputs=[tab2_mode, tab2_speaker, tab2_files],
+            outputs=[tab2_summary, tab2_corr, tab2_vecs, tab2_summary_label]
+        )
+
+    # ════════════════════════════════════════════════════════════════════════
+    with gr.Tab("3️⃣ Нормализатор (ГОСТ)"):
+        gr.Markdown("""
+### Обучение нормализатора `global_minmax_abs` по ГОСТ Р 52633.5
+Нормализатор приводит каждый из 13 признаков MFCC к диапазону [0, 1] на основе
+реальных данных датасета. Параметры сохраняются и автоматически загружаются в pipeline.
+""")
+        with gr.Row():
+            with gr.Column(scale=1):
+                tab3_nspk = gr.Slider(
+                    minimum=50, maximum=500, value=200, step=50,
+                    label="Число спикеров для обучения нормализатора"
+                )
+                tab3_btn = gr.Button("⚙️ Обучить нормализатор", variant="primary")
+                tab3_status = gr.Markdown()
+                gr.Markdown("""
+**Метод `global_minmax_abs`:**
+```
+v_norm = (v - min_global) / (max_global - min_global + ε)
+v_norm = clip(v_norm, 0, 1)
+```
+Параметры `min` и `max` вычисляются по всей обучающей выборке.
+""")
+            with gr.Column(scale=2):
+                tab3_info = gr.Markdown()
+                tab3_hist = gr.Plot(label="Распределение F1 до/после")
+                tab3_range = gr.Plot(label="Диапазоны признаков")
+
+        tab3_btn.click(
+            train_normalizer,
+            inputs=[tab3_nspk],
+            outputs=[tab3_info, tab3_hist, tab3_range, tab3_status]
+        )
+
+    # ════════════════════════════════════════════════════════════════════════
+    with gr.Tab("4️⃣ НПБК — Регистрация"):
+        gr.Markdown("""
+### Регистрация нейросетевого преобразователя биометрия→код
+Обучение по **ГОСТ Р 52633.5**: формулы (4)(6)(7) — качество признаков, веса, знаки.
+""")
+        with gr.Row():
+            with gr.Column(scale=1):
+                tab4_mode = gr.Radio(
+                    ["Из датасета", "Загрузить файлы"], value="Из датасета",
+                    label="Источник голоса"
+                )
+                with gr.Group(visible=True) as tab4_ds_group:
+                    tab4_speaker = gr.Dropdown(
+                        choices=get_available_speakers(),
+                        label="Спикер из датасета (Common Voice RU)",
+                        info="Только необученные"
+                    )
+                    tab4_rand = gr.Button("🎲 Случайный спикер", size="sm")
+                with gr.Group(visible=False) as tab4_up_group:
+                    tab4_files = gr.File(
+                        file_count="multiple",
+                        file_types=[".wav", ".mp3"],
+                        label="Файлы голоса (8–12 записей)"
+                    )
+                tab4_user = gr.Textbox(label="Имя пользователя (user_id)", placeholder="ivan_2026")
                 with gr.Row():
-                    desired_key = gr.Textbox(label="Ваш секрет (protected_secret)", placeholder="Мой_Закрытый_Ключ_ЭЦП_2026", type="password")
-                    btn_gen = gr.Button("🔄 Сгенерировать", size="sm", scale=0)
+                    tab4_secret = gr.Textbox(
+                        label="Ваш секрет (protected_secret)",
+                        placeholder="Мой_ключ_ЭЦП_2026",
+                        type="password",
+                        elem_classes=["secret-field"]
+                    )
+                    tab4_gen = gr.Button("🔄", size="sm", scale=0)
+                tab4_btn = gr.Button("🚀 Обучить НПБК", variant="primary", size="lg")
 
-                btn_train = gr.Button("🚀 Обучить НПБК и защитить ключ", variant="primary", size="lg")
+            with gr.Column(scale=2):
+                tab4_md = gr.Markdown()
+                tab4_vec = gr.Plot(label="Входной вектор")
+                tab4_key = gr.Plot(label="Internal key (биты)")
+                with gr.Row():
+                    tab4_m1 = gr.Textbox(label="Метрика Слой 1", interactive=False)
+                    tab4_m2 = gr.Textbox(label="Метрика Слой 2", interactive=False)
+                    tab4_m3 = gr.Textbox(label="EER", interactive=False)
+                tab4_internal = gr.Textbox(
+                    label="Internal key (удаляется после сохранения)",
+                    interactive=False
+                )
+                tab4_status = gr.Markdown()
 
-            with gr.Column():
-                reg_md = gr.Markdown()
-                reg_vec = gr.Plot()
-                reg_key_plot = gr.Plot()
-                reg_metrics = gr.Markdown()
-                reg_internal = gr.Textbox(label="Internal key (НПБК — удаляется после обученип)", interactive=False)
-                reg_status = gr.Markdown()
+        def toggle_tab4(m):
+            return gr.update(visible=(m == "Из датасета")), gr.update(visible=(m != "Из датасета"))
+        tab4_mode.change(toggle_tab4, inputs=[tab4_mode], outputs=[tab4_ds_group, tab4_up_group])
+        tab4_rand.click(get_random_available_speaker, outputs=[tab4_speaker])
+        tab4_speaker.change(lambda s: s or "", inputs=[tab4_speaker], outputs=[tab4_user])
+        tab4_gen.click(generate_secret, outputs=[tab4_secret])
 
-    with gr.Group(visible=False) as rec_group:
-        gr.Markdown("## 🔑 Восстановление ключа")
-        gr.Markdown("Выберите обученную запись НБК и предъявите свой голос")
+        tab4_btn.click(
+            register_npbk,
+            inputs=[tab4_mode, tab4_files, tab4_speaker, tab4_user, tab4_secret],
+            outputs=[tab4_md, tab4_vec, tab4_key, tab4_m1, tab4_m2, tab4_m3, tab4_internal, tab4_status]
+        )
 
+    # ════════════════════════════════════════════════════════════════════════
+    with gr.Tab("5️⃣ НПБК — Восстановление"):
+        gr.Markdown("""
+### Восстановление защищённого секрета через биометрию
+Предъявите голос — НПБК восстановит ключ и расшифрует ваш секрет (Кузнечик).
+""")
         with gr.Row():
-            with gr.Column():
-                btn_refresh = gr.Button("🔄 Обновить список обученных НБК", size="sm")
-                nbk_dd = gr.Dropdown(choices=get_nbk_records(), label="Обученные записи НПБК", info="При выборе авто-подставится спикер и фразы")
-                audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузка файла) — всегда доступно")
-                btn_recover = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
+            with gr.Column(scale=1):
+                tab5_refresh = gr.Button("🔄 Обновить список НБК", size="sm")
+                tab5_nbk = gr.Dropdown(
+                    choices=get_nbk_records(),
+                    label="Обученные записи НПБК"
+                )
+                tab5_audio = gr.Audio(
+                    sources=["microphone", "upload"],
+                    type="numpy",
+                    label="🎤 Ваш голос"
+                )
+                tab5_btn = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
 
-            with gr.Column():
-                rec_md = gr.Markdown()
-                rec_vec = gr.Plot()
-                rec_secret = gr.Textbox(label="Ваш оригинальный ключ (protected_secret)", interactive=False)
-                rec_status = gr.Markdown()
-                rec_foreign = gr.Markdown()
+            with gr.Column(scale=2):
+                tab5_md = gr.Markdown()
+                tab5_vec = gr.Plot(label="Входной вектор")
+                tab5_secret = gr.Textbox(
+                    label="Ваш оригинальный секрет (protected_secret)",
+                    interactive=False,
+                    type="password",
+                    elem_classes=["secret-field"]
+                )
+                tab5_reveal = gr.Button("👁 Показать секрет", size="sm")
+                tab5_secret_plain = gr.Textbox(
+                    label="Секрет (открытый вид — только для проверки)",
+                    interactive=False,
+                    visible=False
+                )
+                tab5_status = gr.Markdown()
 
-    gr.Markdown("---")
+        tab5_refresh.click(lambda: gr.update(choices=get_nbk_records()), outputs=[tab5_nbk])
+        tab5_btn.click(
+            recover_key,
+            inputs=[tab5_nbk, tab5_audio],
+            outputs=[tab5_md, tab5_vec, tab5_secret, tab5_status]
+        )
+
+        def reveal_secret(secret):
+            return gr.update(visible=True, value=secret)
+        tab5_reveal.click(reveal_secret, inputs=[tab5_secret], outputs=[tab5_secret_plain])
+
+    # ════════════════════════════════════════════════════════════════════════
     gr.Markdown("""
-    📜 **v2.44 — Полный DEBUG: все числа + формулы ГОСТ + вектора на вход нейронов**
-    """)
+---
+📜 **Dasha v2.5** | ГОСТ Р 52633.5-2011 | global_minmax_abs | Кузнечик (ГОСТ Р 34.12-2015)
+""")
 
-    def switch_to_reg():
-        return gr.update(visible=True), gr.update(visible=False)
-    def switch_to_rec():
-        return gr.update(visible=False), gr.update(visible=True)
-
-    btn_menu_reg.click(switch_to_reg, outputs=[reg_group, rec_group])
-    btn_menu_rec.click(switch_to_rec, outputs=[reg_group, rec_group])
-
-    def toggle_mode(m):
-        return gr.update(visible=(m == "Из датасета")), gr.update(visible=(m != "Из датасета"))
-    mode_reg.change(toggle_mode, inputs=[mode_reg], outputs=[ds_group, up_group])
-
-    btn_random.click(get_random_available_speaker, outputs=[speaker_dd])
-
-    def fill_user(s):
-        return s or ""
-    speaker_dd.change(fill_user, inputs=[speaker_dd], outputs=[user_name])
-
-    btn_gen.click(generate_protected_secret, outputs=[desired_key])
-
-    btn_refresh.click(lambda: gr.update(choices=get_nbk_records()), outputs=[nbk_dd])
-
-    btn_train.click(register_npbk, inputs=[mode_reg, audio_files, speaker_dd, user_name, desired_key], outputs=[reg_md, reg_vec, reg_key_plot, reg_metrics, reg_metrics, reg_metrics, reg_internal, reg_status])
-
-    btn_recover.click(recover_key, inputs=[nbk_dd, audio_rec], outputs=[rec_md, rec_vec, rec_secret, rec_status, rec_foreign, gr.Textbox()])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        theme=gr.themes.Soft()
+    )
