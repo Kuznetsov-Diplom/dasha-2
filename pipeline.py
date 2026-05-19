@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Dasha v2.29 — Официальный pipeline по требованиям ГОСТ + PROJECT.md
+Dasha v2.41 — pipeline + подробная отладка обработки звука
 
-- СТРОГО 13-dim (mean MFCC 1-13)
-- global_minmax_abs
-- RASTA = OFF, Delta = OFF (по спецификации)
-- CMVN per-feature
-- Готов к НПБК по ГОСТ Р 52633.5-2011
+Добавлено:
+- get_audio_debug_info() — полный разбор одного файла
+  (VAD %, MFCC статистика до/после CMVN, raw vs norm vector)
+- Используется в app.py для показа "🔍 Отладка обработки звука"
 """
 
 from __future__ import annotations
 import numpy as np
 import librosa
 import scipy.signal as signal
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import json
 
 from normalizer import FeatureNormalizer
-
 
 class VoiceFeaturePipeline:
     SAMPLE_RATE: int = 16000
@@ -33,8 +31,8 @@ class VoiceFeaturePipeline:
     VAD_ENERGY_PERCENTILE: float = 20.0
 
     def __init__(self, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
-        self.use_rasta = use_rasta  # OFF по умолчанию
-        self.use_deltas = use_deltas  # OFF по умолчанию
+        self.use_rasta = use_rasta
+        self.use_deltas = use_deltas
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax_abs")
         self._load_normalizer_if_exists()
 
@@ -121,10 +119,6 @@ class VoiceFeaturePipeline:
 
         mfcc_norm = self._cmvn(mfcc)
 
-        if self.use_rasta and mfcc_norm.shape[1] >= 5:
-            # RASTA отключен по умолчанию
-            pass
-
         if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
             active = mfcc_norm[:, vad_mask]
         else:
@@ -148,8 +142,39 @@ class VoiceFeaturePipeline:
             "sr": sr,
             "dim": dim,
             "dim_label": dim_label,
-            "pipeline_version": "v2.29 ГОСТ 13-dim OFF-RASTA"
+            "pipeline_version": "v2.41 debug"
         }
+
+    def get_audio_debug_info(self, audio_input: str | Path) -> Dict[str, Any]:
+        """Полная отладка обработки одного аудио-файла"""
+        try:
+            res = self.extract_features(audio_input)
+            y = res["y_pre"]
+            vad_mask = res["vad_mask"]
+            mfcc = res["mfcc_rasta"]
+            active = mfcc[:, vad_mask] if np.any(vad_mask) else mfcc
+
+            speech_frames = int(np.sum(vad_mask))
+            total_frames = len(vad_mask)
+            speech_percent = round(100 * speech_frames / max(1, total_frames), 1)
+
+            mfcc_mean = np.mean(active, axis=1).round(4).tolist()
+            mfcc_std = np.std(active, axis=1).round(4).tolist()
+
+            return {
+                "filename": str(audio_input),
+                "duration_sec": round(len(y) / self.SAMPLE_RATE, 2),
+                "speech_frames_percent": speech_percent,
+                "speech_frames": speech_frames,
+                "total_frames": total_frames,
+                "mfcc_mean_1_13": mfcc_mean,
+                "mfcc_std_1_13": mfcc_std,
+                "normalized_vector_preview": res["normalized_vector"][:5] + ["..."],
+                "raw_mean_preview": res["raw_mean_vector"][:5] + ["..."],
+                "vad_ok": speech_percent > 40
+            }
+        except Exception as e:
+            return {"error": str(e), "filename": str(audio_input)}
 
     def get_feature_quality_metrics(self, vectors: list) -> Dict[str, float]:
         if len(vectors) < 2:
