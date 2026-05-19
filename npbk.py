@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.10 — quality gate (FRR/FAR check after training)
+NPBK v2.39 — исправлен по ГОСТ Р 52633.5-2011 (формулы 6,7 + правильный FAR/FRR)
 
-- registered_key не храним открыто
-- Сразу после train() считаем ошибки 1 и 2 рода
-- Если FRR > 10% или хаос у чужих мало — не сохраняем
+Ключевые исправления:
+- μ_i = Q(V_i) / σ_Чужой(V_i) exact по формуле (6)
+- sign(μ_i) = sign(E_свой - E_чужой) по (7)
+- bias: mean_own response ~ +2.5 (глубоко в "1")
+- FAR/FRR теперь реальное: доля чужих, давших ТОЧНО target_key
+- Добавлен детальный quality_report (mean_|mu|, mean_Q, unique_alien_keys)
+- correlation_masking усилен (flip_prob=0.42)
+
+Если FAR всё ещё высокий — проблема в признаках pipeline или мало/нестабильных данных "Свой". Добавь в app.py отладку q(V_i)!
 """
 
 import numpy as np
@@ -13,7 +19,7 @@ from psycopg2.extras import Json
 import os
 import base64
 import hashlib
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 try:
     import gostcrypto
@@ -38,7 +44,7 @@ class NPBK:
         self.encrypted_secret = None
         self.protected_secret = None
         self.use_kuznechik = use_kuznechik and GOSTCRYPTO_AVAILABLE
-        self.quality_report = {}
+        self.quality_report: Dict[str, Any] = {}
 
     def _to_bytes(self, data):
         if data is None: return b""
@@ -98,49 +104,73 @@ class NPBK:
 
         own = np.array(own_vectors, dtype=np.float64)
         alien = np.array(alien_vectors, dtype=np.float64)
-        own = self._morph(own, 12)
-        alien = self._morph(alien, 64)
 
-        E_own, sigma_own = self._compute_stats(own)
-        E_alien, sigma_alien = self._compute_stats(alien)
+        own = self._morph(own, max(11, len(own)))
+        alien = self._morph(alien, max(64, len(alien)))
+
+        E_own = np.mean(own, axis=0)
+        sigma_own = np.std(own, axis=0, ddof=1) + 1e-8
+        E_alien = np.mean(alien, axis=0)
+        sigma_alien = np.std(alien, axis=0, ddof=1) + 1e-8
 
         n = self.key_bits
         w = np.zeros((n, self.input_dim))
         b = np.zeros(n)
+        per_neuron_q = []
+
         for i in range(n):
-            q = np.abs(E_alien - E_own) / (sigma_own + 1e-8)
-            mu = q / (sigma_alien + 1e-8)
-            sign = np.sign(E_own - E_alien) if (i % 2 == 0) else -np.sign(E_own - E_alien)
-            w[i] = sign * mu
-            b[i] = -np.mean(alien @ w[i])
+            q = np.abs(E_alien - E_own) / (sigma_own + sigma_alien)
+            mu = q / sigma_alien
+            target_one = (i % 2 == 0)
+            sign_mu = np.sign(E_own - E_alien + 1e-8)
+            if not target_one:
+                sign_mu = -sign_mu
+            w[i] = sign_mu * mu
+            resp_own = own @ w[i]
+            b[i] = -np.mean(resp_own) + 2.5
+            per_neuron_q.append(float(np.mean(q)))
 
         self.layer1_weights = w
         self.layer1_bias = b
-        self.layer2_weights = np.eye(n) * 0.85
+        self.layer2_weights = np.eye(n) * 0.92
         self._apply_correlation_masking(alien)
         self.trained = True
         self.user_id = user_id
 
-        own_keys = [self.generate_key(v) for v in own[:min(8, len(own))]]
-        alien_keys = [self.generate_key(v) for v in alien[:min(20, len(alien))]]
+        target_vec = np.mean(own, axis=0)
+        target_key = self.generate_key(target_vec)
 
-        unique_own = len(set(own_keys))
-        frr = 0.0 if unique_own == 1 else (unique_own - 1) / len(own_keys)
+        own_keys = [self.generate_key(v) for v in own]
+        frr = sum(k != target_key for k in own_keys) / len(own_keys)
 
-        unique_alien = len(set(alien_keys))
-        far = 1.0 - (unique_alien / len(alien_keys)) if len(alien_keys) > 0 else 1.0
+        alien_sample = alien[:min(80, len(alien))]
+        alien_keys = [self.generate_key(v) for v in alien_sample]
+        far = sum(k == target_key for k in alien_keys) / len(alien_keys)
 
-        self.quality_report = {"FRR": round(frr, 4), "FAR": round(far, 4), "unique_own": unique_own, "unique_alien": unique_alien}
+        mean_mu = float(np.mean(np.abs(w)))
+        mean_q = float(np.mean(per_neuron_q))
 
-        if frr > 0.10 or far < 0.70:
+        self.quality_report = {
+            "FRR": round(frr, 4),
+            "FAR": round(far, 4),
+            "target_key_preview": target_key[:32] + "...",
+            "mean_|mu|": round(mean_mu, 4),
+            "mean_Q": round(mean_q, 4),
+            "num_own_tested": len(own),
+            "num_alien_tested": len(alien_sample),
+            "unique_alien_keys": len(set(alien_keys)),
+            "version": "v2.39 ГОСТ-fixed"
+        }
+
+        if frr > 0.05 or far > 0.05:
             self.trained = False
-            print(f"[NPBK] ОБУЧЕНИЕ ПРОВАЛЕНО! FRR={frr:.1%}, FAR={far:.1%}")
+            print(f"[NPBK] ОБУЧЕНИЕ ПРОВАЛЕНО! FRR={frr:.1%}, FAR={far:.1%} | mean|μ|={mean_mu:.3f}")
             return False, self.quality_report
 
-        key_bytes = bytes(int(own_keys[0][i:i+8], 2) for i in range(0, 128, 8))
+        key_bytes = bytes(int(target_key[i:i+8], 2) for i in range(0, 128, 8))
         self.encrypted_secret = self._kuznechik_encrypt(self.protected_secret.encode("utf-8"), key_bytes)
         self.save_to_db(user_id)
-        print(f"[NPBK] Обучение успешно! FRR={frr:.1%}, FAR={far:.1%}")
+        print(f"[NPBK] Обучение успешно! FRR={frr:.1%}, FAR={far:.1%} | mean|μ|={mean_mu:.3f}")
         return True, self.quality_report
 
     def _compute_stats(self, v): return np.mean(v, axis=0), np.std(v, axis=0, ddof=1)
@@ -148,30 +178,39 @@ class NPBK:
         if len(v) >= target: return v[:target]
         aug = list(v)
         while len(aug) < target:
-            a, b = np.random.choice(len(v), 2, replace=False)
-            alpha = np.random.uniform(0.25, 0.75)
-            aug.append(alpha * v[a] + (1-alpha) * v[b])
+            if len(v) >= 2:
+                a, b = np.random.choice(len(v), 2, replace=False)
+                alpha = np.random.uniform(0.25, 0.75)
+                aug.append((alpha * v[a] + (1-alpha) * v[b]).tolist())
+            else:
+                aug.append((v[0] + np.random.normal(0, 0.01, 13)).tolist())
         return np.array(aug)
+
     def _apply_correlation_masking(self, alien):
         n = self.key_bits
         mask = np.ones((n, self.input_dim))
+        flip_prob = 0.42
         for i in range(n):
-            if np.random.rand() < 0.35: mask[i] *= -1
+            if np.random.rand() < flip_prob:
+                mask[i] *= -1
         self.correlation_mask = mask
-        if self.layer1_weights is not None: self.layer1_weights *= mask
+        if self.layer1_weights is not None:
+            self.layer1_weights = self.layer1_weights * mask
 
     def generate_key(self, vec):
-        if not self.trained or self.layer1_weights is None: raise ValueError("Not trained")
-        y = np.array(vec) @ self.layer1_weights.T + self.layer1_bias
+        if not self.trained or self.layer1_weights is None:
+            raise ValueError("Not trained")
+        y = np.asarray(vec, dtype=np.float64) @ self.layer1_weights.T + self.layer1_bias
         bits = (y > 0).astype(int)
-        if self.layer2_weights is not None: bits = (bits @ self.layer2_weights.T > 0).astype(int)
+        if self.layer2_weights is not None:
+            bits = (bits @ self.layer2_weights.T > 0).astype(int)
         return "".join(map(str, bits))
 
     def save_to_db(self, user_id):
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.38.10')")
+            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.39')")
             cur.execute("INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, encrypted_secret, source_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET layer1_weights=EXCLUDED.layer1_weights, layer1_bias=EXCLUDED.layer1_bias, layer2_weights=EXCLUDED.layer2_weights, correlation_mask=EXCLUDED.correlation_mask, encrypted_secret=EXCLUDED.encrypted_secret, source_type=EXCLUDED.source_type", (user_id, self.key_bits, Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []), Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []), Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []), Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []), self.encrypted_secret or b"", self.source_info.get("type", "upload")))
             conn.commit()
             cur.close()
@@ -203,6 +242,6 @@ class NPBK:
 
 if __name__ == "__main__":
     npbk = NPBK()
-    ok, rep = npbk.train([[0.1]*13 for _ in range(8)], [[0.5]*13 for _ in range(50)], "test", protected_secret="secret123")
+    ok, rep = npbk.train([[0.1]*13 for _ in range(12)], [[0.5]*13 for _ in range(70)], "test", protected_secret="secret123")
     print("Quality:", rep)
     print("SUCCESS" if ok else "FAILED")
