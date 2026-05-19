@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.6 — security: do not store plain protected_secret in DB
+NPBK v2.38.7 — hotfix: robust decrypt/encrypt with type normalization (fix bytes ^ int error on restore)
 
-- protected_secret is no longer saved in plain text (only encrypted_secret)
-- Table updated (ALTER not needed, just stop inserting it)
+- Added _to_bytes helper for memoryview/bytes/str safety
+- Force fallback if GOST not perfect
+- Better error handling in restore path
+- No plain secret ever stored
 """
 
 import numpy as np
@@ -42,10 +44,26 @@ class NPBK:
         self.protected_secret = None
         self.use_kuznechik = use_kuznechik and GOSTCRYPTO_AVAILABLE
 
+    def _to_bytes(self, data) -> bytes:
+        if data is None:
+            return b""
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if isinstance(data, memoryview):
+            return data.tobytes()
+        if isinstance(data, str):
+            return data.encode("utf-8", errors="replace")
+        try:
+            return bytes(data)
+        except:
+            return b""
+
     def _derive_key256(self, key128: bytes) -> bytes:
-        return hashlib.sha256(key128).digest()
+        return hashlib.sha256(self._to_bytes(key128)).digest()
 
     def _kuznechik_encrypt(self, plaintext: bytes, key128: bytes) -> bytes:
+        plaintext = self._to_bytes(plaintext)
+        key128 = self._to_bytes(key128)
         if not plaintext:
             return b""
         if len(key128) < 16:
@@ -68,13 +86,16 @@ class NPBK:
             ct = bytes(p ^ k for p, k in zip(plaintext, expanded))
             return base64.b64encode(ct)
 
-    def _kuznechik_decrypt(self, ciphertext: bytes, key128: bytes) -> bytes:
+    def _kuznechik_decrypt(self, ciphertext, key128: bytes) -> bytes:
+        ciphertext = self._to_bytes(ciphertext)
+        key128 = self._to_bytes(key128)
         if not ciphertext:
             return b""
         try:
-            ct = base64.b64decode(ciphertext) if isinstance(ciphertext, (str, bytes)) else ciphertext
-        except:
-            ct = ciphertext if isinstance(ciphertext, (bytes, bytearray)) else b""
+            ct = base64.b64decode(ciphertext) if ciphertext else b""
+        except Exception:
+            ct = ciphertext  # use raw if not valid b64
+        ct = self._to_bytes(ct)
         if len(key128) < 16:
             key128 = key128.ljust(16, b"\0")
         if not self.use_kuznechik or gostcrypto is None:
@@ -177,7 +198,7 @@ class NPBK:
                     encrypted_secret BYTEA,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.38.6'
+                    version TEXT DEFAULT 'v2.38.7'
                 )
             """)
             cur.execute("""
@@ -225,6 +246,7 @@ class NPBK:
                 self.layer2_weights = np.array(row[4]) if row[4] else None
                 self.correlation_mask = np.array(row[5]) if row[5] else None
                 self.encrypted_secret = row[6]
+                self.protected_secret = None  # security: never restore plain
                 print(f"[DB] Fully loaded: {user_id} (no plain secret)")
                 return True
             return False
