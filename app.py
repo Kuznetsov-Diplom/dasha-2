@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Dasha v2.38 — fix + integration with NPBK v2.38
+Dasha v2.38.1 — hotfix SyntaxError in f-string (nested quotes)
 
-Changes:
-- Use real npbk.registered_key instead of random internal_key
-- In recover: actually decrypt encrypted_secret using the generated biometric key
-- Now correct biometry → real protected_secret via decrypt; wrong → garbage (per GOST)
-- Updated texts, version bump
+Fixed: used_phrase_info f-string now uses single quotes for dict key.
 """
 
 import gradio as gr
@@ -152,7 +148,6 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
     progress(1.0, desc="Готово! Ключ защищён в НБК")
 
     vec_plot = create_vector_bar_plot(vectors[0])
-    # Use REAL registered_key from NPBK
     internal_key = npbk.registered_key
     key_plot = create_binary_key_plot(internal_key)
 
@@ -188,7 +183,8 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     if use_auto and selected_phrase and "path" in selected_phrase:
         path = selected_phrase["path"]
-        used_phrase_info = f" (авто: {selected_phrase.get("sentence", "")[:40]}...)"
+        # FIXED: single quotes inside f-string to avoid SyntaxError
+        used_phrase_info = f" (авто: {selected_phrase.get('sentence', '')[:40]}...)"
     elif audio is not None:
         sr, y = audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -206,7 +202,6 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     progress(0.6, desc="Восстановление через НПБК...")
     try:
         internal_key = npbk.generate_key(vec)
-        # REAL decrypt using the biometric-derived key
         if npbk.encrypted_secret:
             key_bytes = bytes(int(internal_key[i:i+8], 2) for i in range(0, 128, 8))
             decrypted = npbk._kuznechik_decrypt(npbk.encrypted_secret, key_bytes)
@@ -235,9 +230,9 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.38 — Биометрия по голосу (ГОСТ Р 52633.5)", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (ГОСТ Р 52633.5)", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.38 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.38.1 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
@@ -286,7 +281,7 @@ with gr.Blocks(title="Dasha v2.38 — Биометрия по голосу (ГО
             with gr.Column():
                 btn_refresh = gr.Button("🔄 Обновить список обученных НБК", size="sm")
                 nbk_dd = gr.Dropdown(choices=get_nbk_records(), label="Обученные записи НПБК", info="При выборе авто-подставится спикер и фразы")
-                audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузка файла) — всегда доступно")
+                audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузрузка файла) — всегда доступно")
                 btn_recover = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
 
             with gr.Column():
@@ -303,7 +298,7 @@ with gr.Blocks(title="Dasha v2.38 — Биометрия по голосу (ГО
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
 
-    **Dasha v2.38 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.38.1 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
     """)
 
     def switch_to_reg():
