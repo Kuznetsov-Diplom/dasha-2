@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Dasha v2.34 — Топ-меню + футер (по пожеланию пользователя)
+Dasha v2.38 — fix + integration with NPBK v2.38
 
-Изменения v2.34:
-- Меню (выбор разделов) перенесено наверх (горизонтальная навигация)
-- Вся информация о ГОСТ и версии — в футер
-- Сохранены все функции: условная видимость, генерация секрета, обновление списка, авто-подстановка
+Changes:
+- Use real npbk.registered_key instead of random internal_key
+- In recover: actually decrypt encrypted_secret using the generated biometric key
+- Now correct biometry → real protected_secret via decrypt; wrong → garbage (per GOST)
+- Updated texts, version bump
 """
 
 import gradio as gr
@@ -66,7 +67,7 @@ def create_vector_bar_plot(vector, title="Нормализованный 13-ме
     fig.update_layout(title=title, yaxis=dict(range=[0, 1.05]), height=320, template="plotly_white")
     return fig
 
-def create_binary_key_plot(binary_str, title="Internal key (НПБК)"):
+def create_binary_key_plot(binary_str, title="Internal key (NPBK)"):
     bits = [int(b) for b in binary_str[:64]]
     fig = go.Figure(go.Bar(x=list(range(len(bits))), y=bits, marker_color="#00B4D8"))
     fig.update_layout(title=title, yaxis=dict(range=[0, 1.1]), height=180, template="plotly_white")
@@ -121,7 +122,6 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
         return f"Мало записей даже после размножения ({len(vectors)}). Нужно минимум 8", None, None, None, None, None, None, None
 
     progress(0.3, desc="Генерация internal_key...")
-    internal_key = ''.join(random.choice('01') for _ in range(128))
 
     progress(0.5, desc="Обучение НПБК (защита вашего ключа)...")
     alien = []
@@ -146,12 +146,14 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
     progress(0.8, desc="Расчёт метрик...")
     quality = pipeline.get_feature_quality_metrics(vectors)
     layer1_q = round(np.mean([abs(np.mean(v)-0.5) for v in vectors]), 4)
-    layer2_q = round(1.0 - quality.get('mean_feature_correlation', 0.3), 4)
+    layer2_q = round(1.0 - quality.get("mean_feature_correlation", 0.3), 4)
     eer = pipeline.compute_eer([0.9]*len(vectors), [0.1]*len(alien))
 
     progress(1.0, desc="Готово! Ключ защищён в НБК")
 
     vec_plot = create_vector_bar_plot(vectors[0])
+    # Use REAL registered_key from NPBK
+    internal_key = npbk.registered_key
     key_plot = create_binary_key_plot(internal_key)
 
     foreign_info = ", ".join([f"{s[:12]}... ({len(global_speakers.get(s,[]))} фраз)" for s in other_speakers[:4]])
@@ -161,7 +163,7 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
 
     - Пользователь: **{user_name}**
     - Ваш ключ (protected_secret): `{desired_key}` ← **этот ключ теперь защищён биометрией**
-    - Internal key (НПБК): `{internal_key[:32]}...` (удалён после обучения)
+    - Internal key (NPBK): `{internal_key[:32]}...` (удалён после обучения)
     - Качество слоя 1: {layer1_q} | Слоя 2: {layer2_q}
     - EER: {eer}
     - База «Чужой»: {foreign_info} (всего {len(alien)} примеров)
@@ -186,7 +188,7 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     if use_auto and selected_phrase and "path" in selected_phrase:
         path = selected_phrase["path"]
-        used_phrase_info = f" (авто: {selected_phrase.get('sentence', '')[:40]}...)"
+        used_phrase_info = f" (авто: {selected_phrase.get("sentence", "")[:40]}...)"
     elif audio is not None:
         sr, y = audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -204,7 +206,13 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     progress(0.6, desc="Восстановление через НПБК...")
     try:
         internal_key = npbk.generate_key(vec)
-        original_secret = npbk.protected_secret or "(не сохранён)"
+        # REAL decrypt using the biometric-derived key
+        if npbk.encrypted_secret:
+            key_bytes = bytes(int(internal_key[i:i+8], 2) for i in range(0, 128, 8))
+            decrypted = npbk._kuznechik_decrypt(npbk.encrypted_secret, key_bytes)
+            original_secret = decrypted.decode("utf-8", errors="replace")
+        else:
+            original_secret = npbk.protected_secret or "(не сохранён)"
     except Exception as e:
         return f"Ошибка восстановления: {e}", None, None, None, None, None
 
@@ -227,22 +235,19 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.34 — Биометрия по голосу (ГОСТ Р 52633.5)", theme=gr.themes.Soft()) as demo:
-    # ЗАГОЛОВОК
+with gr.Blocks(title="Dasha v2.38 — Биометрия по голосу (ГОСТ Р 52633.5)", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.34 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.38 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
 
-    # ТОП-МЕНЮ (наверх)
     with gr.Row():
         btn_menu_reg = gr.Button("📝 1. Регистрация НПБК", variant="primary", size="lg", scale=1)
         btn_menu_rec = gr.Button("🔑 2. Восстановление ключа", variant="secondary", size="lg", scale=1)
 
     gr.Markdown("---")
 
-    # ОСНОВНОЙ КОНТЕНТ
     with gr.Group(visible=True) as reg_group:
         gr.Markdown("## 📝 Регистрация НПБК")
         gr.Markdown("Выберите источник голоса и защитите свой секрет биометрией")
@@ -291,7 +296,6 @@ with gr.Blocks(title="Dasha v2.34 — Биометрия по голосу (ГО
                 rec_status = gr.Markdown()
                 rec_foreign = gr.Markdown()
 
-    # ФУТЕР (всё остальное)
     gr.Markdown("---")
     gr.Markdown("""
     📜 **Соответствуем ГОСТ Р 52633.5-2011**
@@ -299,10 +303,9 @@ with gr.Blocks(title="Dasha v2.34 — Биометрия по голосу (ГО
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
 
-    **Dasha v2.34 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.38 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
     """)
 
-    # ЛОГИКА
     def switch_to_reg():
         return gr.update(visible=True), gr.update(visible=False)
     def switch_to_rec():
