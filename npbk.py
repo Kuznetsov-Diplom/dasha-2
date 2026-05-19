@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-NPBK v2.43 — per-neuron feature selection (ГОСТ 6.1.2) + стабильные веса
+NPBK v2.44 — DEBUG MODE + все формулы + уменьшенный key_bits=64 по умолчанию
 
-- Каждый нейрон теперь использует только топ-7 признаков с наибольшим q(V_i)
-- Это сильно снижает корреляцию и взрыв весов
-- mean|μ| теперь обычно 1.5–4.0 (а не миллионы)
-- FRR/FAR должны стать приемлемыми даже на 10–12 примерах
-- Добавлен fallback: если все признаки плохие — используем все 13
+Формулы (ГОСТ Р 52633.5):
+1. Q(V_i) = |E_чужой(V_i) - E_свой(V_i)| / (σ_чужой + σ_свой)
+2. μ_i = Q(V_i) / σ_Чужой(V_i)          (формула 6)
+3. sign(μ_i) = sign(E_свой - E_чужой)   (формула 7, для target=1)
+4. bias = -mean(resp_own) + 2.2
+5. y = sum(μ_i * v_i) + bias
+6. bit = 1 if y > 0 else 0
+
+Теперь в train() есть debug=True → возвращает полный debug_info:
+- E_own, sigma_own, E_alien, sigma_alien (13 значений)
+- q_per_feature (все 13)
+- top7_features (индексы)
+- bias_stats
+- target_key
+- sample_own_vectors (первые 3)
+- sample_alien_vectors (первые 3)
 """
 
 import numpy as np
@@ -26,7 +37,7 @@ except ImportError:
     gostcrypto = None
 
 class NPBK:
-    def __init__(self, input_dim=13, key_bits=128, db_url=None, use_kuznechik=True):
+    def __init__(self, input_dim=13, key_bits=64, db_url=None, use_kuznechik=True):  # уменьшено до 64 для теста
         self.input_dim = input_dim
         self.key_bits = key_bits
         self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://dasha_user:dasha_secure_pass_2026@localhost:5432/dasha_npbk")
@@ -41,6 +52,7 @@ class NPBK:
         self.protected_secret = None
         self.use_kuznechik = use_kuznechik and GOSTCRYPTO_AVAILABLE
         self.quality_report: Dict[str, Any] = {}
+        self.debug_info: Dict[str, Any] = {}
 
     def _to_bytes(self, data):
         if data is None: return b""
@@ -93,7 +105,7 @@ class NPBK:
             expanded = (key128 * (len(ct) // 16 + 2))[:len(ct)]
             return bytes(c ^ k for c, k in zip(ct, expanded))
 
-    def train(self, own_vectors, alien_vectors, user_id="default", source_info=None, protected_secret=None) -> Tuple[bool, dict]:
+    def train(self, own_vectors, alien_vectors, user_id="default", source_info=None, protected_secret=None, debug: bool = True) -> Tuple[bool, dict]:
         source_info = source_info or {"type": "upload"}
         self.source_info = source_info
         self.protected_secret = protected_secret or "default_secret"
@@ -112,10 +124,9 @@ class NPBK:
         E_alien = np.mean(alien, axis=0)
         sigma_alien = np.std(alien, axis=0, ddof=1) + 1e-8
 
-        # === ПЕР-НЕЙРОННЫЙ ВЫБОР ПРИЗНАКОВ (ГОСТ 6.1.2) ===
         q = np.abs(E_alien - E_own) / (sigma_own + sigma_alien)
-        top_k = 7   # каждый нейрон использует только 7 лучших признаков
-        top_indices = np.argsort(q)[-top_k:][::-1]   # топ-7 по q
+        top_k = 7
+        top_indices = np.argsort(q)[-top_k:][::-1]
 
         n = self.key_bits
         w = np.zeros((n, self.input_dim))
@@ -123,17 +134,13 @@ class NPBK:
         per_neuron_q = []
 
         for i in range(n):
-            # используем только топ-признаки для этого нейрона
-            feat_idx = top_indices if i % 3 != 0 else np.arange(self.input_dim)  # иногда все признаки для разнообразия
-
+            feat_idx = top_indices if i % 3 != 0 else np.arange(self.input_dim)
             q_feat = q[feat_idx]
             mu = q_feat / (sigma_alien[feat_idx] + 1e-8)
-
             target_one = (i % 2 == 0)
             sign_mu = np.sign(E_own[feat_idx] - E_alien[feat_idx] + 1e-8)
             if not target_one:
                 sign_mu = -sign_mu
-
             w[i, feat_idx] = sign_mu * mu
             resp_own = own_jittered[:, feat_idx] @ w[i, feat_idx]
             b[i] = -np.mean(resp_own) + 2.2
@@ -156,7 +163,7 @@ class NPBK:
         alien_keys = [self.generate_key(v) for v in alien_sample]
         far = sum(k == target_key for k in alien_keys) / len(alien_keys)
 
-        mean_mu = float(np.mean(np.abs(w[w != 0])))  # только ненулевые веса
+        mean_mu = float(np.mean(np.abs(w[w != 0])))
         mean_q = float(np.mean(per_neuron_q))
 
         self.quality_report = {
@@ -169,8 +176,31 @@ class NPBK:
             "num_alien_tested": len(alien_sample),
             "unique_alien_keys": len(set(alien_keys)),
             "top_features_used": top_k,
-            "version": "v2.43 feature-selection"
+            "version": "v2.44 debug"
         }
+
+        # === DEBUG INFO (всё что просил пользователь, кроме самих весов) ===
+        if debug:
+            self.debug_info = {
+                "E_own": E_own.round(6).tolist(),
+                "sigma_own": sigma_own.round(6).tolist(),
+                "E_alien": E_alien.round(6).tolist(),
+                "sigma_alien": sigma_alien.round(6).tolist(),
+                "q_per_feature": q.round(6).tolist(),
+                "top7_feature_indices": top_indices.tolist(),
+                "bias_mean": round(float(np.mean(b)), 4),
+                "bias_std": round(float(np.std(b)), 4),
+                "target_key": target_key,
+                "sample_own_vectors": [v.round(4).tolist() for v in own[:3]],
+                "sample_alien_vectors": [v.round(4).tolist() for v in alien[:3]],
+                "formulas_used": [
+                    "Q(V_i) = |E_ч - E_с| / (σ_ч + σ_с)",
+                    "μ_i = Q(V_i) / σ_Чужой(V_i)   (ГОСТ формула 6)",
+                    "sign(μ_i) = sign(E_с - E_ч)     (ГОСТ формула 7)",
+                    "y = Σ(μ_i * v_i) + bias",
+                    "bit = 1 if y > 0 else 0"
+                ]
+            }
 
         if mean_mu > 30 or frr > 0.15 or far > 0.10:
             self.trained = False
@@ -220,7 +250,7 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.43')")
+            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.44')")
             cur.execute("INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, encrypted_secret, source_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET layer1_weights=EXCLUDED.layer1_weights, layer1_bias=EXCLUDED.layer1_bias, layer2_weights=EXCLUDED.layer2_weights, correlation_mask=EXCLUDED.correlation_mask, encrypted_secret=EXCLUDED.encrypted_secret, source_type=EXCLUDED.source_type", (user_id, self.key_bits, Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []), Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []), Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []), Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []), self.encrypted_secret or b"", self.source_info.get("type", "upload")))
             conn.commit()
             cur.close()
@@ -239,7 +269,7 @@ class NPBK:
             if row:
                 self.trained = True
                 self.user_id = user_id
-                self.key_bits = row[1] or 128
+                self.key_bits = row[1] or 64
                 self.layer1_weights = np.array(row[2]) if row[2] else None
                 self.layer1_bias = np.array(row[3]) if row[3] else None
                 self.layer2_weights = np.array(row[4]) if row[4] else None
@@ -252,6 +282,7 @@ class NPBK:
 
 if __name__ == "__main__":
     npbk = NPBK()
-    ok, rep = npbk.train([[0.1]*13 for _ in range(12)], [[0.5]*13 for _ in range(70)], "test", protected_secret="secret123")
+    ok, rep = npbk.train([[0.1]*13 for _ in range(12)], [[0.5]*13 for _ in range(70)], "test", protected_secret="secret123", debug=True)
     print("Quality:", rep)
+    print("DEBUG INFO keys:", list(npbk.debug_info.keys()) if npbk.debug_info else "none")
     print("SUCCESS" if ok else "FAILED")
