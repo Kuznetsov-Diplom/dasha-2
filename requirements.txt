@@ -7,3 +7,4 @@ plotly>=5.22
 webrtcvad>=2.0.10
 psycopg2-binary>=2.9.9
 sqlalchemy>=2.0.0
+gostcrypto>=1.2.5  # Для Кузнечика (GOST R 34.12-2015) — защита НБК по ГОСТ Р 52633.4
