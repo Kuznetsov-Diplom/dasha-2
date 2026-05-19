@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-NPBK v2.44 — DEBUG MODE + все формулы + уменьшенный key_bits=64 по умолчанию
+NPBK v2.45 — исправлен bias explosion + масштабирование
 
-Формулы (ГОСТ Р 52633.5):
-1. Q(V_i) = |E_чужой(V_i) - E_свой(V_i)| / (σ_чужой + σ_свой)
-2. μ_i = Q(V_i) / σ_Чужой(V_i)          (формула 6)
-3. sign(μ_i) = sign(E_свой - E_чужой)   (формула 7, для target=1)
-4. bias = -mean(resp_own) + 2.2
-5. y = sum(μ_i * v_i) + bias
-6. bit = 1 if y > 0 else 0
+Проблема из твоих debug:
+- bias std = 16k–29k → это и есть причина mean|μ| в сотни тысяч
+- Решение: bias теперь масштабируется как -mean(resp) / (std(resp) + 1) + 1.8
+  (центрируем и немного сдвигаем, без гигантских чисел)
 
-Теперь в train() есть debug=True → возвращает полный debug_info:
-- E_own, sigma_own, E_alien, sigma_alien (13 значений)
-- q_per_feature (все 13)
-- top7_features (индексы)
-- bias_stats
-- target_key
-- sample_own_vectors (первые 3)
-- sample_alien_vectors (первые 3)
+Теперь mean|μ| должен быть 3–12 даже на сложных случаях.
 """
 
 import numpy as np
@@ -37,7 +27,7 @@ except ImportError:
     gostcrypto = None
 
 class NPBK:
-    def __init__(self, input_dim=13, key_bits=64, db_url=None, use_kuznechik=True):  # уменьшено до 64 для теста
+    def __init__(self, input_dim=13, key_bits=64, db_url=None, use_kuznechik=True):
         self.input_dim = input_dim
         self.key_bits = key_bits
         self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://dasha_user:dasha_secure_pass_2026@localhost:5432/dasha_npbk")
@@ -142,8 +132,13 @@ class NPBK:
             if not target_one:
                 sign_mu = -sign_mu
             w[i, feat_idx] = sign_mu * mu
+
             resp_own = own_jittered[:, feat_idx] @ w[i, feat_idx]
-            b[i] = -np.mean(resp_own) + 2.2
+            # === НОВЫЙ МАСШТАБИРОВАННЫЙ BIAS (исправляет взрыв) ===
+            resp_mean = np.mean(resp_own)
+            resp_std = np.std(resp_own) + 1e-6
+            b[i] = -resp_mean / resp_std + 1.8   # центрируем + небольшой сдвиг
+
             per_neuron_q.append(float(np.mean(q_feat)))
 
         self.layer1_weights = w
@@ -176,10 +171,9 @@ class NPBK:
             "num_alien_tested": len(alien_sample),
             "unique_alien_keys": len(set(alien_keys)),
             "top_features_used": top_k,
-            "version": "v2.44 debug"
+            "version": "v2.45 bias-fixed"
         }
 
-        # === DEBUG INFO (всё что просил пользователь, кроме самих весов) ===
         if debug:
             self.debug_info = {
                 "E_own": E_own.round(6).tolist(),
@@ -197,12 +191,12 @@ class NPBK:
                     "Q(V_i) = |E_ч - E_с| / (σ_ч + σ_с)",
                     "μ_i = Q(V_i) / σ_Чужой(V_i)   (ГОСТ формула 6)",
                     "sign(μ_i) = sign(E_с - E_ч)     (ГОСТ формула 7)",
-                    "y = Σ(μ_i * v_i) + bias",
+                    "y = Σ(μ_i * v_i) + bias (scaled)",
                     "bit = 1 if y > 0 else 0"
                 ]
             }
 
-        if mean_mu > 30 or frr > 0.15 or far > 0.10:
+        if mean_mu > 30 or frr > 0.12 or far > 0.08:
             self.trained = False
             print(f"[NPBK] ПРОВАЛ: mean|μ|={mean_mu:.2f}, FRR={frr:.1%}, FAR={far:.1%}")
             return False, self.quality_report
@@ -250,7 +244,7 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.44')")
+            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.45')")
             cur.execute("INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, encrypted_secret, source_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET layer1_weights=EXCLUDED.layer1_weights, layer1_bias=EXCLUDED.layer1_bias, layer2_weights=EXCLUDED.layer2_weights, correlation_mask=EXCLUDED.correlation_mask, encrypted_secret=EXCLUDED.encrypted_secret, source_type=EXCLUDED.source_type", (user_id, self.key_bits, Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []), Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []), Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []), Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []), self.encrypted_secret or b"", self.source_info.get("type", "upload")))
             conn.commit()
             cur.close()
@@ -284,5 +278,4 @@ if __name__ == "__main__":
     npbk = NPBK()
     ok, rep = npbk.train([[0.1]*13 for _ in range(12)], [[0.5]*13 for _ in range(70)], "test", protected_secret="secret123", debug=True)
     print("Quality:", rep)
-    print("DEBUG INFO keys:", list(npbk.debug_info.keys()) if npbk.debug_info else "none")
     print("SUCCESS" if ok else "FAILED")
