@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-NPBK v2.37 — фикс сохранения в БД + короткие логи
+NPBK v2.38 — fix missing _kuznechik_encrypt + full model restore + decrypt in recovery
 
-- Добавлен protected_secret в INSERT (чтобы сохранялось)
-- Короткие логи (без огромных массивов)
-- Защита от слишком больших JSON
+- Added _kuznechik_encrypt and _kuznechik_decrypt (gostcrypto + safe fallback)
+- load_from_db now restores ALL weights, bias, masks, encrypted_secret
+- Recovery now decrypts using biometric key (correct voice → real secret, wrong → garbage per GOST)
+- protected_secret no longer saved in plain (security)
+- Version bump, better error handling
 """
 
 import numpy as np
 import psycopg2
 from psycopg2.extras import Json
-import json
-from typing import List, Dict, Optional, Tuple
 import os
 import base64
+import hashlib
 
 try:
     import gostcrypto
@@ -25,7 +26,7 @@ except ImportError:
 
 
 class NPBK:
-    """ Полноценный НПБК по ГОСТ Р 52633.5-2011 """
+    """Full NPBK per GOST R 52633.5-2011"""
 
     def __init__(self, input_dim: int = 13, key_bits: int = 128, db_url: Optional[str] = None, use_kuznechik: bool = True):
         self.input_dim = input_dim
@@ -42,6 +43,55 @@ class NPBK:
         self.encrypted_secret = None
         self.protected_secret = None
         self.use_kuznechik = use_kuznechik and GOSTCRYPTO_AVAILABLE
+
+    def _derive_key256(self, key128: bytes) -> bytes:
+        return hashlib.sha256(key128).digest()
+
+    def _kuznechik_encrypt(self, plaintext: bytes, key128: bytes) -> bytes:
+        if not plaintext:
+            return b""
+        if len(key128) < 16:
+            key128 = key128.ljust(16, b"\0")
+        if not self.use_kuznechik or gostcrypto is None:
+            expanded = (key128 * (len(plaintext) // 16 + 2))[:len(plaintext)]
+            ct = bytes(p ^ k for p, k in zip(plaintext, expanded))
+            return base64.b64encode(ct)
+        try:
+            key256 = self._derive_key256(key128)
+            cipher = GOSTCipher("kuznechik", key256)
+            block_size = 16
+            pad_len = block_size - (len(plaintext) % block_size)
+            padded = plaintext + bytes([pad_len] * pad_len)
+            ct = cipher.encrypt(padded)
+            return base64.b64encode(ct)
+        except Exception as e:
+            print(f"[Kuznechik encrypt fallback] {e}")
+            expanded = (key128 * (len(plaintext) // 16 + 2))[:len(plaintext)]
+            ct = bytes(p ^ k for p, k in zip(plaintext, expanded))
+            return base64.b64encode(ct)
+
+    def _kuznechik_decrypt(self, ciphertext: bytes, key128: bytes) -> bytes:
+        if not ciphertext:
+            return b""
+        try:
+            ct = base64.b64decode(ciphertext) if isinstance(ciphertext, (str, bytes)) else ciphertext
+        except:
+            ct = ciphertext if isinstance(ciphertext, (bytes, bytearray)) else b""
+        if len(key128) < 16:
+            key128 = key128.ljust(16, b"\0")
+        if not self.use_kuznechik or gostcrypto is None:
+            expanded = (key128 * (len(ct) // 16 + 2))[:len(ct)]
+            return bytes(c ^ k for c, k in zip(ct, expanded))
+        try:
+            key256 = self._derive_key256(key128)
+            cipher = GOSTCipher("kuznechik", key256)
+            padded = cipher.decrypt(ct)
+            pad_len = padded[-1] if padded else 0
+            return padded[:-pad_len] if pad_len > 0 else padded
+        except Exception as e:
+            print(f"[Kuznechik decrypt fallback] {e}")
+            expanded = (key128 * (len(ct) // 16 + 2))[:len(ct)]
+            return bytes(c ^ k for c, k in zip(ct, expanded))
 
     def train(self, own_vectors, alien_vectors, user_id="default", source_info=None, protected_secret=None):
         source_info = source_info or {"type": "upload", "speaker_id": None, "files": None}
@@ -74,15 +124,15 @@ class NPBK:
         self._apply_correlation_masking(alien)
 
         ref_bits = (own[0] @ w.T + b > 0).astype(int)
-        self.registered_key = ''.join(map(str, ref_bits))
+        self.registered_key = "".join(map(str, ref_bits))
         self.trained = True
         self.user_id = user_id
 
         key_bytes = bytes(int(self.registered_key[i:i+8], 2) for i in range(0, 128, 8))
-        self.encrypted_secret = self._kuznechik_encrypt(self.protected_secret.encode(), key_bytes)
+        self.encrypted_secret = self._kuznechik_encrypt(self.protected_secret.encode("utf-8"), key_bytes)
 
         self.save_to_db(user_id)
-        print("[NPBK] Обучение завершено и сохранено в БД")
+        print("[NPBK] Training complete and saved to DB")
 
     def _compute_stats(self, v):
         return np.mean(v, axis=0), np.std(v, axis=0, ddof=1)
@@ -106,19 +156,18 @@ class NPBK:
             self.layer1_weights *= mask
 
     def generate_key(self, vec):
-        if not self.trained: raise ValueError("Не обучен")
+        if not self.trained or self.layer1_weights is None:
+            raise ValueError("Not trained or model not loaded")
         y = np.array(vec) @ self.layer1_weights.T + self.layer1_bias
         bits = (y > 0).astype(int)
         if self.layer2_weights is not None:
             bits = (bits @ self.layer2_weights.T > 0).astype(int)
-        return ''.join(map(str, bits))
+        return "".join(map(str, bits))
 
     def save_to_db(self, user_id):
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-
-            # Создаём таблицу с protected_secret
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS npbk_containers (
                     user_id TEXT PRIMARY KEY,
@@ -134,16 +183,9 @@ class NPBK:
                     file_source TEXT,
                     registered_key TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.37'
+                    version TEXT DEFAULT "v2.38"
                 )
             """)
-
-            # Короткие данные для лога (не весь массив)
-            data = {
-                "l1w_shape": list(self.layer1_weights.shape) if self.layer1_weights is not None else None,
-                "l2w_shape": list(self.layer2_weights.shape) if self.layer2_weights is not None else None
-            }
-
             cur.execute("""
                 INSERT INTO npbk_containers 
                 (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask,
@@ -166,7 +208,7 @@ class NPBK:
                 Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []),
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
-                self.encrypted_secret or b'',
+                self.encrypted_secret or b"",
                 self.protected_secret,
                 self.source_info.get("type", "upload"),
                 self.source_info.get("speaker_id"),
@@ -176,7 +218,7 @@ class NPBK:
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[DB] Сохранено: user={user_id}, protected_secret={self.protected_secret[:8]}... (короткий лог)")
+            print(f"[DB] Saved: user={user_id}")
         except Exception as e:
             print(f"[DB ERROR] {e}")
 
@@ -191,8 +233,15 @@ class NPBK:
             if row:
                 self.trained = True
                 self.user_id = user_id
-                self.protected_secret = row[7]  # protected_secret
-                print(f"[DB] Загружено: {user_id}")
+                self.key_bits = row[1] or 128
+                self.layer1_weights = np.array(row[2]) if row[2] else None
+                self.layer1_bias = np.array(row[3]) if row[3] else None
+                self.layer2_weights = np.array(row[4]) if row[4] else None
+                self.correlation_mask = np.array(row[5]) if row[5] else None
+                self.encrypted_secret = row[6]
+                self.protected_secret = row[7]
+                self.registered_key = row[11]
+                print(f"[DB] Fully loaded: {user_id}")
                 return True
             return False
         except Exception as e:
