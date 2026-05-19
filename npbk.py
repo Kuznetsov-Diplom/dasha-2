@@ -27,8 +27,7 @@ class NPBK:
     def __init__(self, input_dim=13, key_bits=128, db_url=None, use_kuznechik=True):
         self.input_dim = input_dim
         self.key_bits = key_bits
-        self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://dasha_user:dasha_secure_pass_2026@localhost:5432/dasha_npbk
-")
+        self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://dasha_user:dasha_secure_pass_2026@localhost:5432/dasha_npbk")
         self.layer1_weights = None
         self.layer1_bias = None
         self.layer2_weights = None
@@ -122,7 +121,6 @@ class NPBK:
         self.trained = True
         self.user_id = user_id
 
-        # === Оценка качества (FRR / FAR) ===
         own_keys = [self.generate_key(v) for v in own[:min(8, len(own))]]
         alien_keys = [self.generate_key(v) for v in alien[:min(20, len(alien))]]
 
