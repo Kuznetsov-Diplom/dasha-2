@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Dasha v2.38.1 — hotfix SyntaxError in f-string (nested quotes)
+Dasha v2.38.3 — hotfix Gradio 6.0 warning + DB schema
 
-Fixed: used_phrase_info f-string now uses single quotes for dict key.
+- Moved theme= to launch() (Gradio 6.0 compatibility)
+- npbk.py now compatible with existing DB table
 """
 
 import gradio as gr
@@ -117,8 +118,6 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
     if len(vectors) < 8:
         return f"Мало записей даже после размножения ({len(vectors)}). Нужно минимум 8", None, None, None, None, None, None, None
 
-    progress(0.3, desc="Генерация internal_key...")
-
     progress(0.5, desc="Обучение НПБК (защита вашего ключа)...")
     alien = []
     other_speakers = [s for s in speaker_list if s != speaker_id][:6]
@@ -175,7 +174,7 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     user_id = nbk_record.split(" | ")[0]
     loaded = npbk.load_from_db(user_id)
     if not loaded:
-        return f"Не удалось загрузить НПБК для {user_id}", None, None, None, None, None
+        return f"Не удалос загрузить НПБК для {user_id}", None, None, None, None, None
 
     progress(0.3, desc="Подготовка голоса...")
     path = None
@@ -183,7 +182,6 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     if use_auto and selected_phrase and "path" in selected_phrase:
         path = selected_phrase["path"]
-        # FIXED: single quotes inside f-string to avoid SyntaxError
         used_phrase_info = f" (авто: {selected_phrase.get('sentence', '')[:40]}...)"
     elif audio is not None:
         sr, y = audio
@@ -230,16 +228,16 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (ГОСТ Р 52633.5)", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Dasha v2.38.3 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.38.1 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.38.3 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
 
     with gr.Row():
         btn_menu_reg = gr.Button("📝 1. Регистрация НПБК", variant="primary", size="lg", scale=1)
-        btn_menu_rec = gr.Button("🔑 2. Восстановление ключа", variant="secondary", size="lg", scale=1)
+        btn_menu_rec = gr.Button("🔑 2. Востановление ключа", variant="secondary", size="lg", scale=1)
 
     gr.Markdown("---")
 
@@ -274,7 +272,7 @@ with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (Г
                 reg_status = gr.Markdown()
 
     with gr.Group(visible=False) as rec_group:
-        gr.Markdown("## 🔑 Восстановление ключа")
+        gr.Markdown("## 🔑 Востановление ключа")
         gr.Markdown("Выберите обученную запись НБК и предъявите свой голос")
 
         with gr.Row():
@@ -282,7 +280,7 @@ with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (Г
                 btn_refresh = gr.Button("🔄 Обновить список обученных НБК", size="sm")
                 nbk_dd = gr.Dropdown(choices=get_nbk_records(), label="Обученные записи НПБК", info="При выборе авто-подставится спикер и фразы")
                 audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузрузка файла) — всегда доступно")
-                btn_recover = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
+                btn_recover = gr.Button("🔑 Востановить ключ", variant="primary", size="lg")
 
             with gr.Column():
                 rec_md = gr.Markdown()
@@ -298,7 +296,7 @@ with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (Г
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
 
-    **Dasha v2.38.1 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.38.3 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
     """)
 
     def switch_to_reg():
@@ -328,4 +326,4 @@ with gr.Blocks(title="Dasha v2.38.1 — Биометрия по голосу (Г
     btn_recover.click(recover_key, inputs=[nbk_dd, audio_rec, gr.Checkbox(value=True, visible=False), gr.Dropdown(visible=False)], outputs=[rec_md, rec_vec, rec_secret, rec_status, rec_foreign, gr.Textbox()])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
