@@ -18,17 +18,18 @@ services:
       timeout: 5s
       retries: 5
 
-  app:
-    build: .
-    restart: always
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql://dasha_user:dasha_secure_pass_2026@db:5432/dasha_npbk
-      - GRADIO_SERVER_NAME=0.0.0.0
-    ports:
-      - "7860:7860"
+  # app отключен для тестов — запускай локально: python app.py
+  # app:
+  #   build: .
+  #   restart: always
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #   environment:
+  #     - DATABASE_URL=postgresql://dasha_user:dasha_secure_pass_2026@db:5432/dasha_npbk
+  #     - GRADIO_SERVER_NAME=0.0.0.0
+  #   ports:
+  #     - "7860:7860"
 
   # pgAdmin — умная админка PostgreSQL (port 5050)
   pgadmin:
