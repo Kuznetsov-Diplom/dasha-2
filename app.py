@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2.41 — с полной отладкой обработки звука
+Dasha v2.42 — исправлен SyntaxError в f-string
 
-- При провале/успехе теперь показывает "🔍 Отладка обработки звука (первые 3 файла)"
-- VAD %, MFCC mean/std, normalized preview
-- Помогает понять, почему FRR высокий (плохой VAD, плоские признаки и т.д.)
+- Исправлена многострочная f-строка в блоке провала обучения
+- Теперь запускается без ошибок
+- Отладка обработки звука работает корректно
 """
 
 import gradio as gr
@@ -135,7 +135,7 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
     except Exception as e:
         return f"Ошибка: {e}", None, None, None, None, None, None, None
 
-    # === НОВАЯ ОТЛАДКА: первые 3 файла ===
+    # === ОТЛАДКА: первые 3 файла ===
     debug_lines = []
     for i, p in enumerate(paths[:3]):
         dbg = pipeline.get_audio_debug_info(p)
@@ -152,16 +152,15 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
 
     if not success:
         trained_speakers.discard(speaker_id if speaker_id else user_name)
-        return (
-            f"**❌ ОБУЧЕНИЕ ПРОВАЛЕНО!**\n\n"
+        err_msg = (
+            "**❌ ОБУЧЕНИЕ ПРОВАЛЕНО!**\n\n"
             f"- FRR (ошибка 1 рода): {quality['FRR']:.1%}\n"
             f"- FAR (ошибка 2 рода): {quality['FAR']:.1%}\n\n"
-            f"**Отладка ГОСТ v2.41:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}\n\n"
-            f"**🔍 Отладка обработки звука (первые 3 файла):**
-{debug_md}\n\n"
-            f"**Совет:** Если VAD < 50% — попробуй громче/тише запись. Если MFCC std очень маленький — записи слишком похожи.",
-            None, None, None, None, None, None, None
+            f"**Отладка ГОСТ v2.42:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}\n\n"
+            "**🔍 Отладка обработки звука (первые 3 файла):\n" + debug_md + "\n\n"
+            "**Совет:** Если VAD < 50% — попробуй громче/тише запись. Если MFCC std очень маленький — записи слишком похожи."
         )
+        return err_msg, None, None, None, None, None, None, None
 
     trained_speakers.add(speaker_id if speaker_id else user_name)
     save_trained()
@@ -180,22 +179,18 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
 
     foreign_info = ", ".join([f"{s[:12]}... ({len(global_speakers.get(s,[]))} фраз)" for s in other_speakers[:4]])
 
-    md = f"""
-    **✅ Обучение успешно! (Dasha v2.41)**
-
-    - Пользователь: **{user_name}**
-    - Ваш ключ (protected_secret): `{desired_key}` ← **этот ключ теперь защищён биометрией**
-    - Internal key (NPBK): `{internal_key[:32]}...`
-    - **FRR (ошибка 1 рода): {quality['FRR']:.1%}** | **FAR (ошибка 2 рода): {quality['FAR']:.1%}**
-    - EER: {eer}
-    - **Отладка ГОСТ:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}, уникальных ключей у чужих: {quality.get('unique_alien_keys', 0)}/{quality.get('num_alien_tested', 0)}
-    - База «Чужой»: {foreign_info} (всего {len(alien)} примеров)
-
-    **🔍 Отладка обработки звука (первые 3 файла):**
-{debug_md}
-
-    **Чтобы получить ключ снова — только через правильную биометрию!**
-    """
+    md = (
+        f"**✅ Обучение успешно! (Dasha v2.42)**\n\n"
+        f"- Пользователь: **{user_name}**\n"
+        f"- Ваш ключ (protected_secret): `{desired_key}` ← **этот ключ теперь защищён биометрией**\n"
+        f"- Internal key (NPBK): `{internal_key[:32]}...`\n"
+        f"- **FRR (ошибка 1 рода): {quality['FRR']:.1%}** | **FAR (ошибка 2 рода): {quality['FAR']:.1%}**\n"
+        f"- EER: {eer}\n"
+        f"- **Отладка ГОСТ:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}, уникальных ключей у чужих: {quality.get('unique_alien_keys', 0)}/{quality.get('num_alien_tested', 0)}\n"
+        f"- База «Чужой»: {foreign_info} (всего {len(alien)} примеров)\n\n"
+        "**🔍 Отладка обработки звука (первые 3 файла):\n" + debug_md + "\n\n"
+        "**Чтобы получить ключ снова — только через правильную биометрию!**"
+    )
 
     return md, vec_plot, key_plot, f"Слой 1: {layer1_q}", f"Слой 2: {layer2_q}", f"EER: {eer}", internal_key, "✅ Ключ защищён в PostgreSQL. Перейдите на вкладку Восстановление."
 
@@ -256,9 +251,9 @@ def recover_key(nbk_record, audio, progress=gr.Progress()):
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.41 — Биометрия по голосу (ГОСТ Р 52633.5) + отладка") as demo:
+with gr.Blocks(title="Dasha v2.42 — Биометрия по голосу (ГОСТ Р 52633.5) + отладка") as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.41 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.42 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
@@ -325,7 +320,7 @@ with gr.Blocks(title="Dasha v2.41 — Биометрия по голосу (ГО
     - 60+ примеров «Чужой»
     - **Автоматическая оценка FRR/FAR + отладка обработки звука**
 
-    **Dasha v2.41 | Май 2026**
+    **Dasha v2.42 | Май 2026**
     """)
 
     def switch_to_reg():
