@@ -40,7 +40,8 @@ except ImportError as e:
     raise
 
 # ── Глобальные объекты ──────────────────────────────────────────────────────
-pipeline = VoiceFeaturePipeline(use_rasta=False, use_deltas=False)
+pipeline = VoiceFeaturePipeline(use_rasta=False, use_deltas=False,
+                                use_cmvn=False, drop_c0=True)
 npbk = NPBK(key_bits=128)
 loader = CVRuLoader()
 
@@ -76,19 +77,48 @@ def get_random_available_speaker():
 
 
 def get_nbk_records():
+    """Список НБК для дропдауна на вкладке восстановления.
+    Возвращает строки вида 'user_id | source_type | created_at'.
+    speaker_id берётся отдельно через get_nbk_speaker_id().
+    """
+    try:
+        conn = psycopg2.connect(npbk.db_url)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE npbk_containers ADD COLUMN IF NOT EXISTS source_speaker_id TEXT")
+        conn.commit()
+        cur.execute("""
+            SELECT user_id, source_type, source_speaker_id, created_at
+            FROM npbk_containers ORDER BY created_at DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        labels = []
+        for user_id, src_type, src_speaker, created in rows:
+            spk_tag = f"speaker={src_speaker[:12]}…" if src_speaker else "voice=upload"
+            labels.append(f"{user_id} | {src_type} | {spk_tag} | {created}")
+        return labels
+    except Exception as e:
+        print(f"[DB] get_nbk_records error: {e}")
+        return []
+
+
+def get_nbk_speaker_id(user_id: str):
+    """Вернуть source_speaker_id для данного user_id или None."""
     try:
         conn = psycopg2.connect(npbk.db_url)
         cur = conn.cursor()
         cur.execute(
-            "SELECT user_id, source_type, created_at FROM npbk_containers ORDER BY created_at DESC"
+            "SELECT source_speaker_id FROM npbk_containers WHERE user_id=%s",
+            (user_id,)
         )
-        rows = cur.fetchall()
+        row = cur.fetchone()
         cur.close()
         conn.close()
-        return [f"{r[0]} | {r[1]} | {r[2]}" for r in rows]
+        return row[0] if row else None
     except Exception as e:
-        print(f"[DB] get_nbk_records error: {e}")
-        return []
+        print(f"[DB] get_nbk_speaker_id error: {e}")
+        return None
 
 
 def generate_secret():
@@ -351,7 +381,7 @@ def train_normalizer(num_speakers, progress=gr.Progress()):
 
     progress(0.75, desc="Обучение нормализатора...")
     arr = np.array(all_raw)
-    normalizer.fit(arr)
+    normalizer.fit(arr, pipeline_tag=getattr(pipeline, "PIPELINE_TAG", None))
 
     progress(0.85, desc="Сохранение параметров...")
     normalizer.save()
@@ -524,11 +554,13 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
             )
 
     progress(0.55, desc="Обучение НПБК (формулы ГОСТ)...")
+    src_speaker = speaker_id if (mode == "Из датасета" and speaker_id) else None
     try:
         success, quality = npbk.train(
             vectors, alien,
             user_id=user_name,
             protected_secret=desired_key,
+            source_speaker_id=src_speaker,
             debug=True
         )
     except Exception as e:
@@ -677,7 +709,7 @@ docker compose up -d db
 
 # ── НПБК — Восстановление (вкладка 5) ───────────────────────────────────────
 
-def recover_key(nbk_record, audio, progress=gr.Progress()):
+def recover_key(nbk_record, mode, audio, dataset_audio_path, progress=gr.Progress()):
     progress(0, desc="Загрузка НПБК...")
     if not nbk_record:
         return "Выберите запись из НБК", None, "—", ""
@@ -687,13 +719,21 @@ def recover_key(nbk_record, audio, progress=gr.Progress()):
         return f"Не удалось загрузить НПБК для {user_id}", None, "—", ""
 
     progress(0.3, desc="Обработка голоса...")
-    if audio is None:
-        return "Загрузите запись голоса", None, "—", ""
 
-    sr, y = audio
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        sf.write(tmp.name, y, sr)
-        path = tmp.name
+    # Источник аудио
+    path = None
+    if mode == "Из датасета (тот же спикер)":
+        if not dataset_audio_path:
+            return ("Выберите запись из датасета (или у НБК нет привязанного "
+                    "спикера — переключите режим на «Микрофон/файл»)"), None, "—", ""
+        path = dataset_audio_path
+    else:
+        if audio is None:
+            return "Загрузите запись голоса", None, "—", ""
+        sr, y = audio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, y, sr)
+            path = tmp.name
 
     try:
         res = pipeline.extract_features(path)
@@ -720,11 +760,38 @@ def recover_key(nbk_record, audio, progress=gr.Progress()):
 | Параметр | Значение |
 |---|---|
 | Пользователь | **{user_id}** |
+| Привязанный спикер | `{npbk.source_speaker_id or '—'}` |
+| Источник звука | {mode} |
 | Internal key (preview) | `{internal_key[:32]}…` |
 
 > Ваш оригинальный секрет отображён ниже в защищённом поле.
 """
     return rec_md, vec_plot, original_secret, "✅ Ключ восстановлен"
+
+
+def get_dataset_phrases_for_nbk(nbk_record):
+    """По выбранной записи НБК — список (label, path) фраз привязанного спикера."""
+    if not nbk_record:
+        return gr.update(choices=[], value=None, visible=False), ""
+    user_id = nbk_record.split(" | ")[0]
+    speaker = get_nbk_speaker_id(user_id)
+    if not speaker:
+        return (
+            gr.update(choices=[], value=None, visible=False),
+            "_У этой записи нет привязанного спикера датасета (была регистрация загруженными файлами)._"
+        )
+    paths = global_speakers.get(speaker, [])
+    if not paths:
+        return (
+            gr.update(choices=[], value=None, visible=True),
+            f"_Спикер `{speaker[:24]}…` есть в БД, но его аудио нет в датасете локально._"
+        )
+    # Метка = просто имя файла, value = полный путь
+    choices = [(Path(p).name, p) for p in paths[:20]]
+    return (
+        gr.update(choices=choices, value=choices[0][1], visible=True),
+        f"_Привязанный спикер: `{speaker[:24]}…` ({len(paths)} фраз доступно)._"
+    )
 
 
 # ── Gradio UI ────────────────────────────────────────────────────────────────
@@ -917,6 +984,8 @@ v_norm = clip(v_norm, 0, 1)
         gr.Markdown("""
 ### Восстановление защищённого секрета через биометрию
 Предъявите голос — НПБК восстановит ключ и расшифрует ваш секрет (Кузнечик).
+Если НБК обучен на спикере из датасета — можно сразу проверить фразой
+из того же спикера (без записи микрофона).
 """)
         with gr.Row():
             with gr.Column(scale=1):
@@ -925,10 +994,21 @@ v_norm = clip(v_norm, 0, 1)
                     choices=get_nbk_records(),
                     label="Обученные записи НПБК"
                 )
+                tab5_speaker_info = gr.Markdown()
+                tab5_mode = gr.Radio(
+                    ["Микрофон/файл", "Из датасета (тот же спикер)"],
+                    value="Микрофон/файл",
+                    label="Источник голоса для проверки"
+                )
                 tab5_audio = gr.Audio(
                     sources=["microphone", "upload"],
                     type="numpy",
-                    label="🎤 Ваш голос"
+                    label="🎤 Ваш голос",
+                    visible=True
+                )
+                tab5_dataset_phrase = gr.Dropdown(
+                    choices=[], label="Фраза из датасета (привязанного спикера)",
+                    visible=False
                 )
                 tab5_btn = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
 
@@ -949,10 +1029,22 @@ v_norm = clip(v_norm, 0, 1)
                 )
                 tab5_status = gr.Markdown()
 
+        def toggle_tab5(m):
+            is_dataset = (m == "Из датасета (тот же спикер)")
+            return gr.update(visible=not is_dataset), gr.update(visible=is_dataset)
+        tab5_mode.change(toggle_tab5, inputs=[tab5_mode], outputs=[tab5_audio, tab5_dataset_phrase])
+
+        # При выборе НБК — подгружаем фразы привязанного спикера
+        tab5_nbk.change(
+            get_dataset_phrases_for_nbk,
+            inputs=[tab5_nbk],
+            outputs=[tab5_dataset_phrase, tab5_speaker_info]
+        )
+
         tab5_refresh.click(lambda: gr.update(choices=get_nbk_records()), outputs=[tab5_nbk])
         tab5_btn.click(
             recover_key,
-            inputs=[tab5_nbk, tab5_audio],
+            inputs=[tab5_nbk, tab5_mode, tab5_audio, tab5_dataset_phrase],
             outputs=[tab5_md, tab5_vec, tab5_secret, tab5_status]
         )
 

@@ -30,22 +30,47 @@ class VoiceFeaturePipeline:
     MIN_SPEECH_SEC: float = 0.6
     VAD_ENERGY_PERCENTILE: float = 20.0
 
-    def __init__(self, use_rasta: bool = False, use_deltas: bool = False, normalizer: Optional[FeatureNormalizer] = None):
+    def __init__(self, use_rasta: bool = False, use_deltas: bool = False,
+                 use_cmvn: bool = False, drop_c0: bool = True,
+                 normalizer: Optional[FeatureNormalizer] = None):
+        """
+        use_cmvn=False — отключает локальную CMVN. Эмпирически на 300 спикерах
+            Common Voice RU: CMVN режет Fisher ratio разделимости в 2.3 раза.
+            CMVN полезна для распознавания РЕЧИ, но вредна для распознавания
+            ДИКТОРА (биометрии), потому что усредняет долговременный спектр —
+            именно ту часть, по которой различаются голоса.
+        drop_c0=True — отбрасывает 0-й MFCC коэффициент (энергия сигнала),
+            который сильно зависит от условий записи, а не голоса.
+        """
         self.use_rasta = use_rasta
         self.use_deltas = use_deltas
+        self.use_cmvn = use_cmvn
+        self.drop_c0 = drop_c0
         self.normalizer = normalizer or FeatureNormalizer(method="global_minmax_abs")
         self._load_normalizer_if_exists()
 
+    PIPELINE_TAG = "v2.5_no_cmvn_no_c0"  # ключ совместимости с нормализатором
+
     def _load_normalizer_if_exists(self) -> None:
         params_path = Path("models/audio_params/normalizer_params.json")
-        if params_path.exists():
-            try:
-                with open(params_path, "r", encoding="utf-8") as f:
-                    params = json.load(f)
-                self.normalizer.params = params
-                self.normalizer.method = params.get("method", "global_minmax_abs")
-            except Exception as e:
-                print(f"[Pipeline] Не удалось загрузить нормализатор: {e}")
+        if not params_path.exists():
+            return
+        try:
+            with open(params_path, "r", encoding="utf-8") as f:
+                params = json.load(f)
+            # Проверяем совместимость pipeline ↔ нормализатор.
+            # После смены препроцессинга диапазоны MFCC изменились на порядок,
+            # старый JSON применять нельзя — иначе всё клипнется в 0/1.
+            saved_tag = params.get("pipeline_tag")
+            if saved_tag != self.PIPELINE_TAG:
+                print(f"[Pipeline] ⚠️ Нормализатор обучен на старом препроцессинге "
+                      f"({saved_tag or 'unknown'} ≠ {self.PIPELINE_TAG}). "
+                      f"Переобучите на вкладке 3, иначе будут плохие векторы.")
+                return
+            self.normalizer.params = params
+            self.normalizer.method = params.get("method", "global_minmax_abs")
+        except Exception as e:
+            print(f"[Pipeline] Не удалось загрузить нормализатор: {e}")
 
     @staticmethod
     def _pre_emphasis(y: np.ndarray, alpha: float = 0.97) -> np.ndarray:
@@ -110,14 +135,24 @@ class VoiceFeaturePipeline:
         hop_length = int(self.FRAME_SHIFT_MS * sr / 1000)
         vad_mask = self._vad(y_pre, sr)
 
+        # Если отбрасываем C0 — извлекаем на 1 коэффициент больше, чтобы
+        # итоговая размерность осталась 13 (C1..C13 вместо C0..C12).
+        n_mfcc_extract = self.N_MFCC + 1 if self.drop_c0 else self.N_MFCC
         mfcc = librosa.feature.mfcc(
-            y=y_pre, sr=sr, n_mfcc=self.N_MFCC,
+            y=y_pre, sr=sr, n_mfcc=n_mfcc_extract,
             n_fft=frame_length, hop_length=hop_length,
             n_mels=self.N_MELS, fmin=self.FMIN, fmax=self.FMAX,
             window="hamming", center=True, norm="ortho"
         )
+        if self.drop_c0:
+            mfcc = mfcc[1:]  # C1..C13
 
-        mfcc_norm = self._cmvn(mfcc)
+        # CMVN опциональна. По умолчанию выключена: эмпирически она
+        # уничтожает межспикерную разделимость (Fisher 1.34 → 3.05).
+        if self.use_cmvn:
+            mfcc_norm = self._cmvn(mfcc)
+        else:
+            mfcc_norm = mfcc.astype(np.float32)
 
         if np.any(vad_mask) and vad_mask.shape[0] == mfcc_norm.shape[1]:
             active = mfcc_norm[:, vad_mask]
@@ -127,8 +162,10 @@ class VoiceFeaturePipeline:
         mean_vec = np.mean(active, axis=1)
 
         full_vec = mean_vec
-        dim = 13
-        dim_label = "13-dim (mean only) + global_minmax_abs (ГОСТ-ready)"
+        dim = self.N_MFCC
+        cmvn_tag = "CMVN" if self.use_cmvn else "no-CMVN"
+        c0_tag = "no-C0" if self.drop_c0 else "with-C0"
+        dim_label = f"{dim}-dim (mean MFCC, {c0_tag}, {cmvn_tag}) + global_minmax_abs"
 
         normalized = self.normalizer.transform(full_vec)
 
@@ -142,7 +179,7 @@ class VoiceFeaturePipeline:
             "sr": sr,
             "dim": dim,
             "dim_label": dim_label,
-            "pipeline_version": "v2.42"
+            "pipeline_version": "v2.5 (no-CMVN, no-C0)"
         }
 
     def get_audio_debug_info(self, audio_input: str | Path) -> Dict[str, Any]:

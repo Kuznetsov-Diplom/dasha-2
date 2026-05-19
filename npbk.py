@@ -49,6 +49,7 @@ class NPBK:
         self.trained: bool = False
         self.user_id: Optional[str] = None
         self.source_info: Dict = {}
+        self.source_speaker_id: Optional[str] = None
         self.encrypted_secret: Optional[bytes] = None
         self.protected_secret: Optional[str] = None
         self.use_kuznechik: bool = use_kuznechik and GOSTCRYPTO_AVAILABLE
@@ -243,10 +244,12 @@ class NPBK:
     def train(self, own_vectors: List, alien_vectors: List,
               user_id: str = "default", source_info: Dict = None,
               protected_secret: str = None,
+              source_speaker_id: Optional[str] = None,
               debug: bool = True) -> Tuple[bool, Dict]:
 
         source_info = source_info or {"type": "upload"}
         self.source_info = source_info
+        self.source_speaker_id = source_speaker_id
         self.protected_secret = protected_secret or "default_secret"
 
         own = np.array(own_vectors, dtype=np.float64)
@@ -529,15 +532,19 @@ class NPBK:
                     correlation_mask JSONB,
                     encrypted_secret BYTEA,
                     source_type TEXT,
+                    source_speaker_id TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.7'
+                    version TEXT DEFAULT 'v2.8'
                 )
             """)
+            # Миграция: добавляем колонку, если её ещё нет (для старых установок)
+            cur.execute("ALTER TABLE npbk_containers ADD COLUMN IF NOT EXISTS source_speaker_id TEXT")
             cur.execute("""
                 INSERT INTO npbk_containers
                     (user_id, key_bits, layer1_weights, layer1_bias,
-                     layer2_weights, correlation_mask, encrypted_secret, source_type, version)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     layer2_weights, correlation_mask, encrypted_secret,
+                     source_type, source_speaker_id, version)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     key_bits = EXCLUDED.key_bits,
                     layer1_weights = EXCLUDED.layer1_weights,
@@ -546,6 +553,7 @@ class NPBK:
                     correlation_mask = EXCLUDED.correlation_mask,
                     encrypted_secret = EXCLUDED.encrypted_secret,
                     source_type = EXCLUDED.source_type,
+                    source_speaker_id = EXCLUDED.source_speaker_id,
                     version = EXCLUDED.version,
                     created_at = NOW()
             """, (
@@ -556,11 +564,12 @@ class NPBK:
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
                 self.encrypted_secret or b"",
                 self.source_info.get("type", "upload"),
-                "v2.7"
+                self.source_speaker_id,
+                "v2.8"
             ))
             conn.commit()
             cur.close()
-            print(f"[DB] ✅ Сохранено: {user_id}")
+            print(f"[DB] ✅ Сохранено: {user_id} (speaker={self.source_speaker_id})")
         finally:
             conn.close()
 
@@ -568,21 +577,30 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT * FROM npbk_containers WHERE user_id=%s", (user_id,))
+            # Тихая миграция: на случай если запись из старой схемы
+            cur.execute("ALTER TABLE npbk_containers ADD COLUMN IF NOT EXISTS source_speaker_id TEXT")
+            conn.commit()
+            cur.execute("""
+                SELECT key_bits, layer1_weights, layer1_bias, layer2_weights,
+                       correlation_mask, encrypted_secret, source_speaker_id
+                FROM npbk_containers WHERE user_id=%s
+            """, (user_id,))
             row = cur.fetchone()
             cur.close()
             conn.close()
             if row:
+                key_bits, l1w, l1b, l2w, cmask, enc_secret, src_speaker = row
                 self.trained = True
                 self.user_id = user_id
-                self.key_bits = row[1] or 64
-                self.layer1_weights = np.array(row[2]) if row[2] else None
-                self.layer1_bias = np.array(row[3]) if row[3] else None
-                self.layer2_weights = np.array(row[4]) if row[4] else None
-                self.correlation_mask = np.array(row[5]) if row[5] else None
-                self.encrypted_secret = row[6]
+                self.key_bits = key_bits or 128
+                self.layer1_weights = np.array(l1w) if l1w else None
+                self.layer1_bias = np.array(l1b) if l1b else None
+                self.layer2_weights = np.array(l2w) if l2w else None
+                self.correlation_mask = np.array(cmask) if cmask else None
+                self.encrypted_secret = enc_secret
+                self.source_speaker_id = src_speaker
                 self.protected_secret = None
-                print(f"[DB] ✅ Загружено: {user_id}")
+                print(f"[DB] ✅ Загружено: {user_id} (speaker={src_speaker})")
                 return True
             print(f"[DB] ℹ️ Запись не найдена: {user_id}")
             return False
@@ -602,7 +620,7 @@ class NPBK:
 # ── Тест ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== Тест NPBK v2.6 ===")
+    print("=== Тест NPBK v2.8 ===")
     np.random.seed(42)
 
     # Создаём синтетические данные с разделимыми классами

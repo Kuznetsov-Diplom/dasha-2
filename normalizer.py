@@ -25,10 +25,14 @@ class FeatureNormalizer:
 
     # ── Обучение ─────────────────────────────────────────────────────────────
 
-    def fit(self, vectors: np.ndarray) -> None:
+    def fit(self, vectors: np.ndarray, pipeline_tag: Optional[str] = None) -> None:
         """
         Обучить нормализатор на массиве (N, 13).
         По ГОСТ Р 52633.5 рекомендуется global_minmax_abs.
+
+        Используются 1й и 99й перцентили вместо абсолютных min/max
+        (робастная нормализация): после отключения CMVN raw MFCC могут
+        давать редкие выбросы, которые иначе съели бы весь диапазон.
         """
         arr = np.asarray(vectors, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] != 13:
@@ -37,9 +41,8 @@ class FeatureNormalizer:
             raise ValueError(f"Слишком мало векторов для обучения: {len(arr)}. Нужно ≥ 10.")
 
         if self.method == "global_minmax_abs":
-            min_v = np.min(arr, axis=0)
-            max_v = np.max(arr, axis=0)
-            # Проверка: нет ли вырожденных признаков
+            min_v = np.percentile(arr, 1, axis=0)
+            max_v = np.percentile(arr, 99, axis=0)
             degenerate = np.where((max_v - min_v) < 1e-6)[0]
             if len(degenerate) > 0:
                 print(f"[Normalizer] ⚠️ Вырожденные признаки (диапазон ≈ 0): F{degenerate + 1}")
@@ -48,7 +51,9 @@ class FeatureNormalizer:
                 "min": min_v.tolist(),
                 "max": max_v.tolist(),
                 "n_samples": int(len(arr)),
-                "coverage_pct": self._compute_coverage(arr, min_v, max_v)
+                "coverage_pct": self._compute_coverage(arr, min_v, max_v),
+                "pipeline_tag": pipeline_tag,
+                "robust": "percentile_1_99",
             }
 
         elif self.method == "standard":
