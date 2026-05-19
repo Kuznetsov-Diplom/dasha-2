@@ -1,0 +1,35 @@
+# .dockerignore — ускоряет сборку, data/ НЕ исключаем (обязательный датасет Common Voice RU)
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenv
+venv/
+.env
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Experiments (не нужны в рантайме)
+experiment_*.py
+normalization_experiment.py
+
+# Temp / logs
+*.log
+*.tmp
+
+# Docker meta
+Dockerfile
+.dockerignore
+
+docker-compose.yml
+README.md
+PROJECT.md
+
+# IDE
+.idea/
+.vscode/

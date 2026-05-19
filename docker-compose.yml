@@ -29,6 +29,8 @@ services:
       - GRADIO_SERVER_NAME=0.0.0.0
     ports:
       - "7860:7860"
+    volumes:
+      - ./data:/app/data:ro   # ← датасет монтируется отдельно (не копируется в образ при сборке!)
 
   # pgAdmin — умная админка PostgreSQL (port 5050)
   pgadmin:
