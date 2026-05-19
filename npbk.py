@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38 — fix missing _kuznechik_encrypt + full model restore + decrypt in recovery
+NPBK v2.38.2 — hotfix missing Optional import
 
-- Added _kuznechik_encrypt and _kuznechik_decrypt (gostcrypto + safe fallback)
-- load_from_db now restores ALL weights, bias, masks, encrypted_secret
-- Recovery now decrypts using biometric key (correct voice → real secret, wrong → garbage per GOST)
-- protected_secret no longer saved in plain (security)
-- Version bump, better error handling
+Fixed: added from typing import Optional (was causing NameError in Docker)
 """
 
 import numpy as np
@@ -15,6 +11,7 @@ from psycopg2.extras import Json
 import os
 import base64
 import hashlib
+from typing import Optional
 
 try:
     import gostcrypto
@@ -183,7 +180,7 @@ class NPBK:
                     file_source TEXT,
                     registered_key TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT "v2.38"
+                    version TEXT DEFAULT "v2.38.2"
                 )
             """)
             cur.execute("""
