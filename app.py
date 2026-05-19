@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2.38.7 — hotfix restore error (bytes ^ int fixed in NPBK) + typo fix + Gradio 6.0
+Dasha v2.38.8 — strict verification + speaker/phrase selector in recovery (user request)
 
-- npbk.py v2.38.7 with _to_bytes robust handling
-- Fixed "Востановление" -> "Восстановление"
-- Better error messages in recover
-- Always push after fixes per rules
+- Radio switch in Восстановление: "Из датасета" / "Свой файл"
+- Speaker + phrase dropdowns for testing 'Свой' vs 'Чужой'
+- Strict match: only decrypt if internal_key == registered_key
+- Old plain protected_secret ignored
 """
 
 import gradio as gr
@@ -49,15 +49,27 @@ def get_random_available_speaker():
     avail = get_available_speakers()
     return random.choice(avail) if avail else None
 
+def get_trained_speakers():
+    return sorted(list(trained_speakers))
+
+def get_phrases_for_speaker(speaker_id):
+    if speaker_id in global_speakers:
+        return [{"sentence": p.get("sentence", f"фраза {i+1}"), "path": p} for i, p in enumerate(global_speakers[speaker_id][:8])]
+    return []
+
 def get_nbk_records():
     try:
         conn = psycopg2.connect(npbk.db_url)
         cur = conn.cursor()
-        cur.execute("SELECT user_id, protected_secret, source_type, created_at FROM npbk_containers ORDER BY created_at DESC")
+        cur.execute("SELECT user_id, source_type, created_at, registered_key FROM npbk_containers ORDER BY created_at DESC")
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        return [f"{r[0]} | {r[2]} | {r[3]}" for r in rows]
+        labels = []
+        for r in rows:
+            rk = r[3] or "?"
+            labels.append(f"{r[0]} | {r[1]} | {str(r[2])[:10]} | key:{rk[:8]}...")
+        return labels
     except:
         return []
 
@@ -168,7 +180,7 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
 
     return md, vec_plot, key_plot, f"Слой 1: {layer1_q}", f"Слой 2: {layer2_q}", f"EER: {eer}", internal_key, "✅ Ключ защищён в PostgreSQL. Перейдите на вкладку Восстановление."
 
-def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progress()):
+def recover_key(nbk_record, mode_rec, speaker_rec, phrase_rec, audio, progress=gr.Progress()):
     progress(0, desc="Загрузка НПБК...")
     if not nbk_record:
         return "Выберите запись из НБК", None, None, None, None, None
@@ -182,16 +194,21 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     path = None
     used_phrase_info = ""
 
-    if use_auto and selected_phrase and "path" in selected_phrase:
-        path = selected_phrase["path"]
-        used_phrase_info = f" (авто: {selected_phrase.get('sentence', '')[:40]}...)"
+    if mode_rec == "Из датасета (тест 'Свой'/'Чужой')" and speaker_rec:
+        phrases = get_phrases_for_speaker(speaker_rec)
+        if phrase_rec and isinstance(phrase_rec, dict) and "path" in phrase_rec:
+            path = phrase_rec["path"]
+            used_phrase_info = f" (датасет: {speaker_rec} — {phrase_rec.get('sentence', '')[:30]}...)"
+        elif phrases:
+            path = phrases[0]["path"]
+            used_phrase_info = f" (авто: {speaker_rec})"
     elif audio is not None:
         sr, y = audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             sf.write(tmp.name, y, sr)
             path = tmp.name
     else:
-        return "Загрузите запись голоса или выберите фразу из датасета", None, None, None, None, None
+        return "Загрузите запись или выберите спикера+фразу из датасета", None, None, None, None, None
 
     try:
         res = pipeline.extract_features(path)
@@ -199,42 +216,54 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     except Exception as e:
         return f"Ошибка обработки: {e}", None, None, None, None, None
 
-    progress(0.6, desc="Восстановление через НПБК...")
+    progress(0.6, desc="Восстановление через НПБК (строгая проверка ГОСТ)...")
     try:
         internal_key = npbk.generate_key(vec)
+        if npbk.registered_key and internal_key != npbk.registered_key:
+            return (
+                f"**❌ Биометрия НЕ совпадает (Чужой)!**\n\n"
+                f"- Сгенерированный internal_key: `{internal_key[:32]}...`\n"
+                f"- Ожидаемый (при регистрации): `{npbk.registered_key[:32]}...`\n\n"
+                f"**Ключ НЕ восстановлен.** Получен случайный результат (по ГОСТ Р 52633.5).\n"
+                f"Это подтверждает защиту от подбора!", 
+                create_vector_bar_plot(vec, title="Входной вектор (Чужой — отклонён)"), 
+                "(не восстановлен — Чужой)", 
+                "❌ Отказано: голос не соответствует обученному спикеру", 
+                "**Тест 'Чужой' пройден успешно**", ""
+            )
         if npbk.encrypted_secret:
             key_bytes = bytes(int(internal_key[i:i+8], 2) for i in range(0, 128, 8))
             decrypted = npbk._kuznechik_decrypt(npbk.encrypted_secret, key_bytes)
             original_secret = decrypted.decode("utf-8", errors="replace")
         else:
-            original_secret = npbk.protected_secret or "(не сохранён)"
+            original_secret = "(старый формат — обновите запись)"
     except Exception as e:
         return f"Ошибка восстановления: {e}", None, None, None, None, None
 
     progress(1.0, desc="Готово!")
 
-    vec_plot = create_vector_bar_plot(vec, title="Входной вектор при восстановлении")
+    vec_plot = create_vector_bar_plot(vec, title="Входной вектор при восстановлении (Свой ✓)")
 
     foreign_md = "** База «Чужой» при обучении:**\n- Использовано 60+ реальных фраз от других спикеров датасета (по ГОСТ Р 52633.5)\n- Пример: спикеры с 8–15 фразами каждый (хаос случайных образов)"
 
     md = f"""
-    **✅ Ключ восстановлен!**
+    **✅ Ключ восстановлен! (строгая проверка пройдена)**
 
     - Пользователь: **{user_id}**{used_phrase_info}
     - **Ваш оригинальный ключ (protected_secret):** `{original_secret}`
-    - Internal key НПБК: `{internal_key[:32]}...`
+    - Internal key НПБК: `{internal_key[:32]}...` (совпал с эталоном)
 
     **Это именно тот ключ, который вы ввели при регистрации.**
     {foreign_md}
     """
 
-    return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
+    return md, vec_plot, original_secret, "✅ Восстановление успешно! Только правильная биометрия даёт ключ.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
+with gr.Blocks(title="Dasha v2.38.8 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.38.7 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.38.8 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
-    **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
+    **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — **только при точном совпадении биометрии** (строгая проверка)
     """)
 
     with gr.Row():
@@ -274,15 +303,22 @@ with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (Г
                 reg_status = gr.Markdown()
 
     with gr.Group(visible=False) as rec_group:
-        gr.Markdown("## 🔑 Восстановление ключа")
-        gr.Markdown("Выберите обученную запись НБК и предъявите свой голос")
+        gr.Markdown("## 🔑 Восстановление ключа (строгая проверка ГОСТ)")
+        gr.Markdown("Выберите обученную запись НБК. Для теста можно использовать спикера из датасета (проверить 'Чужой' vs 'Свой')")
 
         with gr.Row():
             with gr.Column():
                 btn_refresh = gr.Button("🔄 Обновить список обученных НБК", size="sm")
                 nbk_dd = gr.Dropdown(choices=get_nbk_records(), label="Обученные записи НПБК", info="При выборе авто-подставится спикер и фразы")
+
+                mode_rec = gr.Radio(["Из датасета (тест 'Свой'/'Чужой')", "Загрузить файл / микрофон"], value="Загрузить файл / микрофон", label="Источник голоса для восстановления")
+
+                with gr.Group(visible=False) as ds_rec_group:
+                    speaker_rec = gr.Dropdown(choices=get_trained_speakers(), label="Спикер из датасета (для теста)", info="Только обученные спикеры")
+                    phrase_rec = gr.Dropdown(choices=[], label="Фраза спикера (для точного теста 'Свой')", info="Авто-заполняется при выборе спикера")
+
                 audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузка файла) — всегда доступно")
-                btn_recover = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
+                btn_recover = gr.Button("🔑 Восстановить ключ (строгая проверка)", variant="primary", size="lg")
 
             with gr.Column():
                 rec_md = gr.Markdown()
@@ -297,8 +333,9 @@ with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (Г
     - Раздельное обучение нейронов
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
+    - **Строгая проверка**: ключ только при 100% совпадении internal_key
 
-    **Dasha v2.38.7 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.38.8 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
     """)
 
     def switch_to_reg():
@@ -313,6 +350,15 @@ with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (Г
         return gr.update(visible=(m == "Из датасета")), gr.update(visible=(m != "Из датасета"))
     mode_reg.change(toggle_mode, inputs=[mode_reg], outputs=[ds_group, up_group])
 
+    def toggle_mode_rec(m):
+        return gr.update(visible=(m == "Из датасета (тест 'Свой'/'Чужой')")), gr.update(visible=(m != "Из датасета (тест 'Свой'/'Чужой')"))
+    mode_rec.change(toggle_mode_rec, inputs=[mode_rec], outputs=[ds_rec_group, audio_rec])
+
+    def update_phrases(speaker):
+        phrases = get_phrases_for_speaker(speaker)
+        return gr.update(choices=phrases, value=phrases[0] if phrases else None)
+    speaker_rec.change(update_phrases, inputs=[speaker_rec], outputs=[phrase_rec])
+
     btn_random.click(get_random_available_speaker, outputs=[speaker_dd])
 
     def fill_user(s):
@@ -325,7 +371,7 @@ with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (Г
 
     btn_train.click(register_npbk, inputs=[mode_reg, audio_files, speaker_dd, user_name, desired_key], outputs=[reg_md, reg_vec, reg_key_plot, reg_metrics, reg_metrics, reg_metrics, reg_internal, reg_status])
 
-    btn_recover.click(recover_key, inputs=[nbk_dd, audio_rec, gr.Checkbox(value=True, visible=False), gr.Dropdown(visible=False)], outputs=[rec_md, rec_vec, rec_secret, rec_status, rec_foreign, gr.Textbox()])
+    btn_recover.click(recover_key, inputs=[nbk_dd, mode_rec, speaker_rec, phrase_rec, audio_rec], outputs=[rec_md, rec_vec, rec_secret, rec_status, rec_foreign, gr.Textbox()])
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
