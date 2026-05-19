@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.5 — fix PostgreSQL DEFAULT syntax (single quotes)
+NPBK v2.38.6 — security: do not store plain protected_secret in DB
 
-- version TEXT DEFAULT 'v2.38.5' (single quotes, not double)
-- Table now creates correctly on first run
+- protected_secret is no longer saved in plain text (only encrypted_secret)
+- Table updated (ALTER not needed, just stop inserting it)
 """
 
 import numpy as np
@@ -175,24 +175,22 @@ class NPBK:
                     layer2_weights JSONB,
                     correlation_mask JSONB,
                     encrypted_secret BYTEA,
-                    protected_secret TEXT,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.38.5'
+                    version TEXT DEFAULT 'v2.38.6'
                 )
             """)
             cur.execute("""
                 INSERT INTO npbk_containers 
                 (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask,
-                 encrypted_secret, protected_secret, source_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 encrypted_secret, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
                     layer2_weights = EXCLUDED.layer2_weights,
                     correlation_mask = EXCLUDED.correlation_mask,
                     encrypted_secret = EXCLUDED.encrypted_secret,
-                    protected_secret = EXCLUDED.protected_secret,
                     source_type = EXCLUDED.source_type
             """, (
                 user_id, self.key_bits,
@@ -201,13 +199,12 @@ class NPBK:
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
                 self.encrypted_secret or b"",
-                self.protected_secret,
                 self.source_info.get("type", "upload")
             ))
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[DB] Saved: user={user_id}")
+            print(f"[DB] Saved: user={user_id} (plain secret removed for security)")
         except Exception as e:
             print(f"[DB ERROR] {e}")
 
@@ -228,8 +225,7 @@ class NPBK:
                 self.layer2_weights = np.array(row[4]) if row[4] else None
                 self.correlation_mask = np.array(row[5]) if row[5] else None
                 self.encrypted_secret = row[6]
-                self.protected_secret = row[7]
-                print(f"[DB] Fully loaded: {user_id}")
+                print(f"[DB] Fully loaded: {user_id} (no plain secret)")
                 return True
             return False
         except Exception as e:
