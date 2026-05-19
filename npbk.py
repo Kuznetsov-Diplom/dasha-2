@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.8 — strict verification + registered_key persistence (ГОСТ compliance)
+NPBK v2.38.9 — hotfix: always enforce registered_key for strict decrypt (fix 'decrypts with any file')
 
-- Store registered_key (128-bit output code) for exact-match check on restore
-- Only decrypt if generated internal_key == registered_key (prevents 'Чужой' success)
-- Added ALTER for old DBs
-- _to_bytes safety kept
+- If old record has no registered_key → refuse with clear message
+- New records (after v2.38.8) always have it → real biometric gate
+- Secret is ONLY in encrypted_secret (never plain after v2.38.6)
 """
 
 import numpy as np
@@ -187,7 +186,6 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            # Ensure column exists (for old DBs)
             cur.execute("ALTER TABLE IF EXISTS npbk_containers ADD COLUMN IF NOT EXISTS registered_key TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS npbk_containers (
@@ -201,7 +199,7 @@ class NPBK:
                     registered_key TEXT,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.38.8'
+                    version TEXT DEFAULT 'v2.38.9'
                 )
             """)
             cur.execute("""
@@ -230,7 +228,7 @@ class NPBK:
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[DB] Saved: user={user_id} (registered_key stored for strict verify)")
+            print(f"[DB] Saved: user={user_id} (registered_key stored)")
         except Exception as e:
             print(f"[DB ERROR] {e}")
 
@@ -238,7 +236,7 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT * FROM npbk_containers WHERE user_id=%s", (user_id,))
+            cur.execute("SELECT user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, encrypted_secret, registered_key, source_type, created_at, version FROM npbk_containers WHERE user_id=%s", (user_id,))
             row = cur.fetchone()
             cur.close()
             conn.close()
@@ -251,9 +249,9 @@ class NPBK:
                 self.layer2_weights = np.array(row[4]) if row[4] else None
                 self.correlation_mask = np.array(row[5]) if row[5] else None
                 self.encrypted_secret = row[6]
-                self.registered_key = row[7] if len(row) > 7 else None  # new column
+                self.registered_key = row[7] if row[7] else None
                 self.protected_secret = None
-                print(f"[DB] Fully loaded: {user_id} (strict verify ready)")
+                print(f"[DB] Fully loaded: {user_id} (registered_key={'yes' if self.registered_key else 'NO - old record'}) ")
                 return True
             return False
         except Exception as e:
