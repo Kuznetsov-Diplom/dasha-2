@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.4 — final DB schema fix (remove registered_key too)
+NPBK v2.38.5 — fix PostgreSQL DEFAULT syntax (single quotes)
 
-- Now CREATE TABLE exactly matches your live pgAdmin table
-- No more column does not exist errors
+- version TEXT DEFAULT 'v2.38.5' (single quotes, not double)
+- Table now creates correctly on first run
 """
 
 import numpy as np
@@ -178,7 +178,7 @@ class NPBK:
                     protected_secret TEXT,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT "v2.38.4"
+                    version TEXT DEFAULT 'v2.38.5'
                 )
             """)
             cur.execute("""
