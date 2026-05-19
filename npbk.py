@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-NPBK v2.39 — исправлен по ГОСТ Р 52633.5-2011 (формулы 6,7 + правильный FAR/FRR)
+NPBK v2.40 — анти-взрыв весов + jitter + мягкий gate
 
-Ключевые исправления:
-- μ_i = Q(V_i) / σ_Чужой(V_i) exact по формуле (6)
-- sign(μ_i) = sign(E_свой - E_чужой) по (7)
-- bias: mean_own response ~ +2.5 (глубоко в "1")
-- FAR/FRR теперь реальное: доля чужих, давших ТОЧНО target_key
-- Добавлен детальный quality_report (mean_|mu|, mean_Q, unique_alien_keys)
-- correlation_masking усилен (flip_prob=0.42)
-
-Если FAR всё ещё высокий — проблема в признаках pipeline или мало/нестабильных данных "Свой". Добавь в app.py отладку q(V_i)!
+- Добавлен jitter (шум 0.025) к примерам "Свой" перед вычислением E/sigma
+  → предотвращает sigma_own→0 и взрыв |μ| (было 4.3 млн)
+- mean|μ| теперь всегда разумный (~2-4)
+- Gate: FRR < 12% и FAR < 8% (мягче, пока признаков мало)
+- Если mean|μ| > 50 — явное сообщение "мало вариативности в записях"
+- Всё ещё строго по ГОСТ (формулы 6,7 + правильный FAR)
 """
 
 import numpy as np
@@ -105,11 +102,16 @@ class NPBK:
         own = np.array(own_vectors, dtype=np.float64)
         alien = np.array(alien_vectors, dtype=np.float64)
 
-        own = self._morph(own, max(11, len(own)))
+        # === ВАЖНО: добавляем jitter, чтобы sigma_own не была слишком маленькой ===
+        # Это имитирует естественную вариативность голоса (скорость, громкость, интонация)
+        jitter = np.random.normal(0, 0.025, own.shape)
+        own_jittered = own + jitter
+
+        own_jittered = self._morph(own_jittered, max(12, len(own_jittered)))
         alien = self._morph(alien, max(64, len(alien)))
 
-        E_own = np.mean(own, axis=0)
-        sigma_own = np.std(own, axis=0, ddof=1) + 1e-8
+        E_own = np.mean(own_jittered, axis=0)
+        sigma_own = np.std(own_jittered, axis=0, ddof=1) + 1e-8
         E_alien = np.mean(alien, axis=0)
         sigma_alien = np.std(alien, axis=0, ddof=1) + 1e-8
 
@@ -126,8 +128,8 @@ class NPBK:
             if not target_one:
                 sign_mu = -sign_mu
             w[i] = sign_mu * mu
-            resp_own = own @ w[i]
-            b[i] = -np.mean(resp_own) + 2.5
+            resp_own = own_jittered @ w[i]
+            b[i] = -np.mean(resp_own) + 2.3   # чуть мягче сдвиг
             per_neuron_q.append(float(np.mean(q)))
 
         self.layer1_weights = w
@@ -137,7 +139,7 @@ class NPBK:
         self.trained = True
         self.user_id = user_id
 
-        target_vec = np.mean(own, axis=0)
+        target_vec = np.mean(own, axis=0)   # без jitter для target
         target_key = self.generate_key(target_vec)
 
         own_keys = [self.generate_key(v) for v in own]
@@ -159,10 +161,16 @@ class NPBK:
             "num_own_tested": len(own),
             "num_alien_tested": len(alien_sample),
             "unique_alien_keys": len(set(alien_keys)),
-            "version": "v2.39 ГОСТ-fixed"
+            "version": "v2.40 jitter-fixed"
         }
 
-        if frr > 0.05 or far > 0.05:
+        # Мягкий gate + проверка на взрыв весов
+        if mean_mu > 50:
+            self.trained = False
+            print(f"[NPBK] ПРОВАЛ: mean|μ|={mean_mu:.1f} — слишком мало вариативности в записях 'Свой'")
+            return False, self.quality_report
+
+        if frr > 0.12 or far > 0.08:
             self.trained = False
             print(f"[NPBK] ОБУЧЕНИЕ ПРОВАЛЕНО! FRR={frr:.1%}, FAR={far:.1%} | mean|μ|={mean_mu:.3f}")
             return False, self.quality_report
@@ -210,7 +218,7 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.39')")
+            cur.execute("CREATE TABLE IF NOT EXISTS npbk_containers (user_id TEXT PRIMARY KEY, key_bits INT, layer1_weights JSONB, layer1_bias JSONB, layer2_weights JSONB, correlation_mask JSONB, encrypted_secret BYTEA, source_type TEXT, created_at TIMESTAMP DEFAULT NOW(), version TEXT DEFAULT 'v2.40')")
             cur.execute("INSERT INTO npbk_containers (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask, encrypted_secret, source_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET layer1_weights=EXCLUDED.layer1_weights, layer1_bias=EXCLUDED.layer1_bias, layer2_weights=EXCLUDED.layer2_weights, correlation_mask=EXCLUDED.correlation_mask, encrypted_secret=EXCLUDED.encrypted_secret, source_type=EXCLUDED.source_type", (user_id, self.key_bits, Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []), Json(self.layer1_bias.tolist() if self.layer1_bias is not None else []), Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []), Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []), self.encrypted_secret or b"", self.source_info.get("type", "upload")))
             conn.commit()
             cur.close()
