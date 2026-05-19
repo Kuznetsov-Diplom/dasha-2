@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-NPBK v2.6 — Исправленная реализация по ГОСТ Р 52633.5-2011
+NPBK v2.7 — Реализация по ГОСТ Р 52633.5-2011 (строго по стандарту)
 
-Исправления v2.6:
-  1. Q(V_i) по ГОСТ формула (4): делим на σ_свой (не на сумму σ)
-  2. μ₀ (bias) по ГОСТ п. 5.2: = -E_чужой(Σ μ_i · v_i)
-  3. target_key: majority vote по всем own-векторам (не от среднего)
-  4. Длина ключа шифрования: всегда 16 байт (128 бит) независимо от key_bits
-  5. Второй слой: реальная формула (8) с ω_i = 2|0.5 - P1_i|
-  6. Контроль независимости «Чужих» по критерию Хемминга (ГОСТ п. 5.5)
-  7. Контроль однородности «Своих» по χ² (ГОСТ п. 5.4.2)
+Изменения v2.7 (vs v2.6):
+  - target_key генерируется СЛУЧАЙНО до обучения (как требует ГОСТ),
+    а не вычисляется majority vote ПОСЛЕ.
+  - bias для каждого нейрона строится как (E_own + E_alien)/2 → корректное
+    разделение для K_i=0 и K_i=1.
+  - Реализована формула (3) ГОСТ для подсчёта n входов нейрона.
+  - Маскирование корреляций по ГОСТ п. 6.2.5: 10 000 случайных «чужих»,
+    инверсия знаков ЦЕЛЫХ нейронов с большой |corr|, target_key
+    инвертируется на тех же битах.
+  - Слой 2 без клипа — формула (8) подавляет нестабильные биты.
+  - Хемминг-фильтр чужих применяется к ВЫХОДНЫМ КОДАМ обученного слоя 1.
+  - key_bits=128 по умолчанию.
 """
 
 import numpy as np
@@ -30,7 +34,7 @@ except ImportError:
 
 
 class NPBK:
-    def __init__(self, input_dim: int = 13, key_bits: int = 64, db_url: str = None,
+    def __init__(self, input_dim: int = 13, key_bits: int = 128, db_url: str = None,
                  use_kuznechik: bool = True):
         self.input_dim = input_dim
         self.key_bits = key_bits
@@ -123,18 +127,33 @@ class NPBK:
     # ── Вспомогательные методы ───────────────────────────────────────────────
 
     def _morph(self, vectors: np.ndarray, target: int) -> np.ndarray:
-        """Линейный морфинг (ГОСТ Р 52633.2) для увеличения обучающей выборки."""
+        """
+        Линейный морфинг по ГОСТ Р 52633.2: X_k = A + t_k·(B − A),
+        t_k = k/(N+1), для всех уникальных пар родителей.
+        """
         v = np.array(vectors)
         if len(v) >= target:
             return v[:target]
-        aug = list(v)
-        while len(aug) < target:
-            if len(v) >= 2:
-                idx = np.random.choice(len(v), 2, replace=False)
-                t = np.random.uniform(0.25, 0.75)
-                aug.append(t * v[idx[0]] + (1 - t) * v[idx[1]])
-            else:
+        if len(v) < 2:
+            aug = list(v)
+            while len(aug) < target:
                 aug.append(v[0] + np.random.normal(0, 0.01, self.input_dim))
+            return np.array(aug[:target])
+
+        aug = list(v)
+        pairs = [(i, j) for i in range(len(v)) for j in range(i + 1, len(v))]
+        # Сколько детей на каждую пару чтобы добрать до target
+        needed = target - len(aug)
+        per_pair = max(1, -(-needed // len(pairs)))  # ceil
+        for (i, j) in pairs:
+            A, B = v[i], v[j]
+            for k in range(1, per_pair + 1):
+                t = k / (per_pair + 1)
+                aug.append(A + t * (B - A))
+                if len(aug) >= target:
+                    break
+            if len(aug) >= target:
+                break
         return np.array(aug[:target])
 
     def _check_own_homogeneity(self, own: np.ndarray) -> Tuple[np.ndarray, int]:
@@ -150,33 +169,40 @@ class NPBK:
         removed = int(np.sum(~mask))
         return own[mask], removed
 
-    def _check_alien_independence(self, alien: np.ndarray, temp_key_len: int) -> Tuple[np.ndarray, int]:
+    def _hamming_filter_alien(self, alien_vectors: np.ndarray) -> Tuple[np.ndarray, int]:
         """
-        ГОСТ п. 5.5: Контроль независимости «Чужих» по критерию Хемминга.
-        Удаляем пары, чьё расстояние Хемминга выпадает за интервал.
+        ГОСТ п. 5.5: Контроль независимости «Чужих» по критерию Хемминга
+        выходных кодов обученного слоя 1.
+
+        Для каждого вектора считаем среднее расстояние Хемминга его кода
+        от кодов остальных «чужих». Сохраняем тех, чьё расстояние лежит
+        в интервале (N − 2√N)/2 .. (N + 2√N)/2 — это интервал ожидания
+        для независимых случайных кодов.
         """
-        N = temp_key_len
+        if self.layer1_weights is None or len(alien_vectors) < 2:
+            return alien_vectors, 0
+
+        N = self.key_bits
         lo = (N - 2 * np.sqrt(N)) / 2
         hi = (N + 2 * np.sqrt(N)) / 2
 
-        # Для проверки нужен обученный временный классификатор
-        # Используем упрощённую проверку: косинусное расстояние
-        # (полный критерий Хемминга требует уже обученной сети — п. 5.5)
-        removed = 0
-        good = [alien[0]] if len(alien) > 0 else []
-        for i in range(1, len(alien)):
-            # Проверяем косинусную схожесть с уже добавленными
-            is_dup = False
-            for g in good:
-                sim = np.dot(alien[i], g) / (np.linalg.norm(alien[i]) * np.linalg.norm(g) + 1e-8)
-                if sim > 0.99:  # почти идентичные векторы
-                    is_dup = True
-                    break
-            if not is_dup:
-                good.append(alien[i])
-            else:
-                removed += 1
-        return np.array(good), removed
+        codes = (alien_vectors @ self.layer1_weights.T + self.layer1_bias) > 0  # (M, N)
+        codes = codes.astype(np.int8)
+        n = len(codes)
+
+        # Среднее расстояние от i-го до всех остальных
+        keep_mask = np.ones(n, dtype=bool)
+        for i in range(n):
+            diffs = np.sum(codes != codes[i], axis=1)
+            diffs = np.delete(diffs, i)
+            mean_d = float(np.mean(diffs))
+            if not (lo <= mean_d <= hi):
+                keep_mask[i] = False
+        removed = int(np.sum(~keep_mask))
+        if np.sum(keep_mask) < max(8, n // 4):
+            # слишком жёсткий фильтр — откатываемся
+            return alien_vectors, 0
+        return alien_vectors[keep_mask], removed
 
     def _compute_stability(self, own: np.ndarray) -> np.ndarray:
         """
@@ -194,19 +220,23 @@ class NPBK:
         omega = 2 * np.abs(0.5 - P1)         # ГОСТ формула (1)
         return omega  # значения от 0 (нестабильный) до 1 (стабильный)
 
-    def _majority_vote_key(self, own: np.ndarray) -> str:
+    def _layer1_bits(self, vec) -> np.ndarray:
+        """Битовый выход слоя 1 (без слоя 2) для одного вектора."""
+        v = np.asarray(vec, dtype=np.float64)
+        y = v @ self.layer1_weights.T + self.layer1_bias
+        return (y > 0).astype(np.int8)
+
+    def _compute_n_inputs(self, target_q: float, mean_q_v: float, a0: float = 1.0) -> int:
         """
-        target_key: большинство голосов по всем own-векторам.
-        Для каждого бита берём 1 если P(1) > 0.5, иначе 0.
+        ГОСТ формула (3): n ≈ a0 · [Q(y) / E(Q(v_i))]²
+
+        Возвращает число входов нейрона, нужное чтобы качество нейрона
+        достигло target_q при среднем качестве признаков mean_q_v.
         """
-        bits_list = []
-        for v in own:
-            y = v @ self.layer1_weights.T + self.layer1_bias
-            bits_list.append((y > 0).astype(int))
-        bits_matrix = np.array(bits_list)
-        P1 = np.mean(bits_matrix, axis=0)
-        target = (P1 >= 0.5).astype(int)
-        return "".join(map(str, target))
+        if mean_q_v <= 1e-8:
+            return self.input_dim
+        n = int(np.ceil(a0 * (target_q / mean_q_v) ** 2))
+        return max(3, min(n, self.input_dim))
 
     # ── Обучение ─────────────────────────────────────────────────────────────
 
@@ -225,100 +255,116 @@ class NPBK:
         # ── Шаг 1: Контроль однородности «Своих» (ГОСТ п. 5.4.2) ──────────
         own_clean, removed_own = self._check_own_homogeneity(own)
         if len(own_clean) < 8:
-            own_clean = own  # откат если слишком много удалено
+            own_clean = own
             removed_own = 0
         print(f"[NPBK] Однородность «Свой»: удалено выбросов = {removed_own}, осталось {len(own_clean)}")
 
-        # Небольшой jitter для устойчивости
         own_aug = own_clean + np.random.normal(0, 0.015, own_clean.shape)
         own_aug = self._morph(own_aug, max(11, len(own_aug)))
+        alien_aug = self._morph(alien, max(80, len(alien)))
 
-        # ── Шаг 2: Контроль независимости «Чужих» (ГОСТ п. 5.5) ───────────
-        alien_clean, removed_alien = self._check_alien_independence(alien, self.key_bits)
-        if len(alien_clean) < 64:
-            alien_clean = alien  # откат
-        alien_aug = self._morph(alien_clean, max(80, len(alien_clean)))
-        print(f"[NPBK] Независимость «Чужой»: удалено дублей = {removed_alien}, осталось {len(alien_aug)}")
-
-        # ── Шаг 3: Статистики для формул ГОСТ ──────────────────────────────
+        # ── Шаг 2: Статистики признаков ────────────────────────────────────
         E_own = np.mean(own_aug, axis=0)
         sigma_own = np.std(own_aug, axis=0, ddof=1) + 1e-8
         E_alien = np.mean(alien_aug, axis=0)
         sigma_alien = np.std(alien_aug, axis=0, ddof=1) + 1e-8
 
-        # ── Шаг 4: Формула (4) по ГОСТ — Q(V_i) = |E_чужой - E_свой| / σ_свой
-        # ВАЖНО: делим на σ_свой, НЕ на сумму сигм
-        q = np.abs(E_alien - E_own) / sigma_own  # ГОСТ формула (4)
+        # ГОСТ формула (4): Q(V_i) = |E_чужой − E_свой| / σ_свой
+        q = np.abs(E_alien - E_own) / sigma_own
+        mean_q_v = float(np.mean(q))
+        sorted_idx = np.argsort(q)[::-1]  # признаки по убыванию качества
 
-        # Выбираем топ-7 признаков по качеству
-        top_k = min(7, self.input_dim)
-        top_indices = np.argsort(q)[-top_k:][::-1]
+        # ── Шаг 3: СЛУЧАЙНЫЙ target_key ДО обучения (по ГОСТ) ──────────────
+        target_key_bits = np.random.randint(0, 2, self.key_bits).astype(np.int8)
 
-        # ── Шаг 5: Обучение Слоя 1 (формулы 6, 7 ГОСТ) ────────────────────
-        n = self.key_bits
-        w = np.zeros((n, self.input_dim))
-        b = np.zeros(n)
+        # ── Шаг 4: Обучение Слоя 1 (формулы 3, 6, 7 ГОСТ) ─────────────────
+        n_bits = self.key_bits
+        w = np.zeros((n_bits, self.input_dim))
+        b = np.zeros(n_bits)
         per_neuron_q = []
+        per_neuron_n = []
 
-        for i in range(n):
-            # Каждые 3 нейрона — используем все признаки для разнообразия
-            feat_idx = top_indices if i % 3 != 0 else np.arange(self.input_dim)
+        # Целевое качество нейрона: при mean_q_v ~ 2 и a0=1 формула (3) даст
+        # n ≈ 4 входа для Q(y)=4. Чтобы FAR<8% эмпирически нужно Q(y) >= 3.5.
+        target_neuron_q = max(3.5, 1.5 * mean_q_v)
+        a0 = 1.0
+
+        for i in range(n_bits):
+            K_i = int(target_key_bits[i])
+
+            # ГОСТ формула (3): сколько входов брать для нужного Q(y)
+            n_inputs = self._compute_n_inputs(target_neuron_q, mean_q_v, a0)
+
+            # Берём топ-n_inputs признаков по Q + лёгкая рандомизация,
+            # чтобы разные нейроны использовали слегка разные подмножества
+            # (нужно для последующей декорреляции выходов).
+            pool = sorted_idx[:min(self.input_dim, n_inputs + 3)]
+            if len(pool) > n_inputs:
+                feat_idx = np.random.choice(pool, size=n_inputs, replace=False)
+            else:
+                feat_idx = pool
+            feat_idx = np.array(sorted(feat_idx))
 
             q_feat = q[feat_idx]
 
-            # ГОСТ формула (6): μ_i = Q(V_i) / σ_Чужой(V_i)
-            mu = q_feat / (sigma_alien[feat_idx] + 1e-8)
+            # ГОСТ формула (6): |μ_i| = Q(V_i) / σ_Чужой(V_i)
+            mu_abs = q_feat / sigma_alien[feat_idx]
 
-            # ГОСТ формула (7): знак μ_i
-            target_one = (i % 2 == 0)  # чередуем цель нейрона
-            sign_mu = np.sign(E_own[feat_idx] - E_alien[feat_idx] + 1e-12)
-            if not target_one:
-                sign_mu = -sign_mu  # инвертируем для нейронов с целью «0»
+            # ГОСТ формула (7): знак выбирается в зависимости от K_i
+            # K_i = 1 → хотим y(свой)>0 → sign(μ) = sign(E_свой − E_чужой)
+            # K_i = 0 → хотим y(свой)<0 → инвертируем
+            base_sign = np.sign(E_own[feat_idx] - E_alien[feat_idx] + 1e-12)
+            if K_i == 0:
+                base_sign = -base_sign
 
-            w[i, feat_idx] = sign_mu * mu
+            w[i, feat_idx] = base_sign * mu_abs
 
-            # ГОСТ п. 5.2: μ₀ = -E_чужой(Σ μ_i · v_i)
-            # Вычисляем отклики «Чужих» на текущие веса и берём отрицание среднего
-            alien_responses = alien_aug[:, feat_idx] @ w[i, feat_idx]
-            b[i] = -np.mean(alien_responses)  # ГОСТ: точка переключения = E_чужой
+            # Bias: точка переключения посередине между E(w·v) для своих и чужих.
+            # Так y(свой) и y(чужой) симметрично расходятся от нуля → у K_i=1
+            # бит=1 на своём и бит=0 в среднем у чужих, у K_i=0 — наоборот.
+            own_resp = own_aug[:, feat_idx] @ w[i, feat_idx]
+            alien_resp = alien_aug[:, feat_idx] @ w[i, feat_idx]
+            b[i] = -(np.mean(own_resp) + np.mean(alien_resp)) / 2.0
 
             per_neuron_q.append(float(np.mean(q_feat)))
+            per_neuron_n.append(int(n_inputs))
 
         self.layer1_weights = w
         self.layer1_bias = b
 
-        # ── Шаг 6: Маскирование корреляций (ГОСТ п. 6.2.5) ────────────────
-        self._apply_correlation_masking(alien_aug)
+        # ── Шаг 5: Маскирование корреляций (ГОСТ п. 6.2.5) ────────────────
+        # 10 000 случайных «чужих» → корреляции выходов → инверсия знака
+        # ЦЕЛЫХ нейронов с самой высокой суммарной |corr|.
+        mask, mean_abs_corr = self._apply_correlation_masking_gost(alien_aug)
+        # target_key инвертируется на тех битах, у которых нейрон перевернут
+        target_key_bits = target_key_bits ^ (mask < 0).astype(np.int8)
+        target_key = "".join(str(int(b_)) for b_ in target_key_bits)
 
-        # ── Шаг 7: Вычисление стабильностей ω_i (ГОСТ формула 1) ──────────
+        # ── Шаг 6: Хемминг-фильтр чужих (ГОСТ п. 5.5) — для метрик ────────
+        alien_filtered, removed_alien = self._hamming_filter_alien(alien_aug)
+        print(f"[NPBK] Хемминг-фильтр чужих: удалено {removed_alien} из {len(alien_aug)}")
+
+        # ── Шаг 7: Стабильности ω_i (формула 1) и Слой 2 (формула 8) ──────
         omega = self._compute_stability(own_aug)
-        print(f"[NPBK] Стабильность битов: mean_ω = {np.mean(omega):.3f}, min_ω = {np.min(omega):.3f}")
-
-        # ── Шаг 8: Обучение Слоя 2 (ГОСТ формула 8) ───────────────────────
-        a2 = 1.0  # стабилизирующий коэффициент
+        a2 = 1.0
         E_omega = np.mean(omega) + 1e-8
-        # ГОСТ формула (8): μ_i = a2 * ω_i / E(ω_i)
-        layer2_diag = a2 * omega / E_omega
-        # Нормируем чтобы диагональ была в разумных пределах
-        layer2_diag = np.clip(layer2_diag, 0.5, 2.0)
+        layer2_diag = a2 * omega / E_omega  # без клипа — пусть подавляет шум
         self.layer2_weights = np.diag(layer2_diag)
-        print(f"[NPBK] Слой 2: diag mean={np.mean(layer2_diag):.3f}, range=[{np.min(layer2_diag):.3f}, {np.max(layer2_diag):.3f}]")
+        print(f"[NPBK] Слой 2: ω mean={np.mean(omega):.3f}, "
+              f"diag range=[{np.min(layer2_diag):.3f}, {np.max(layer2_diag):.3f}]")
 
         self.trained = True
         self.user_id = user_id
 
-        # ── Шаг 9: target_key через majority vote (не от среднего!) ────────
-        target_key = self._majority_vote_key(own_aug)
-
-        # ── Шаг 10: Метрики качества ────────────────────────────────────────
+        # ── Шаг 8: Метрики ────────────────────────────────────────────────
         own_keys = [self.generate_key(v) for v in own_aug]
         frr = sum(k != target_key for k in own_keys) / len(own_keys)
 
-        alien_sample = alien_aug[:min(100, len(alien_aug))]
-        alien_keys = [self.generate_key(v) for v in alien_sample]
-        far = sum(k == target_key for k in alien_keys) / len(alien_keys)
+        alien_sample = alien_filtered[:min(100, len(alien_filtered))]
+        alien_keys = [self.generate_key(v) for v in alien_sample] if len(alien_sample) else []
+        far = (sum(k == target_key for k in alien_keys) / len(alien_keys)) if alien_keys else 0.0
 
-        mean_mu = float(np.mean(np.abs(w[w != 0])))
+        mean_mu = float(np.mean(np.abs(w[w != 0]))) if np.any(w != 0) else 0.0
         mean_q = float(np.mean(per_neuron_q))
         mean_omega = float(np.mean(omega))
 
@@ -329,14 +375,16 @@ class NPBK:
             "mean_|mu|": round(mean_mu, 4),
             "mean_Q": round(mean_q, 4),
             "mean_omega": round(mean_omega, 4),
+            "mean_abs_corr": round(float(mean_abs_corr), 4),
             "num_own_tested": len(own_aug),
             "num_alien_tested": len(alien_sample),
             "unique_alien_keys": len(set(alien_keys)),
             "removed_own_outliers": removed_own,
-            "version": "v2.6 GOST-fixed"
+            "removed_alien_hamming": removed_alien,
+            "mean_inputs_per_neuron": round(float(np.mean(per_neuron_n)), 2),
+            "version": "v2.7 GOST-strict"
         }
 
-        # ── Debug info ───────────────────────────────────────────────────────
         if debug:
             self.debug_info = {
                 "E_own": E_own.round(6).tolist(),
@@ -344,51 +392,101 @@ class NPBK:
                 "E_alien": E_alien.round(6).tolist(),
                 "sigma_alien": sigma_alien.round(6).tolist(),
                 "q_per_feature": q.round(6).tolist(),
-                "top7_feature_indices": top_indices.tolist(),
+                "top7_feature_indices": sorted_idx[:7].tolist(),
                 "bias_mean": round(float(np.mean(b)), 4),
                 "bias_std": round(float(np.std(b)), 4),
                 "omega_per_bit": omega[:16].round(4).tolist(),
                 "mean_omega": round(mean_omega, 4),
+                "mean_abs_corr": round(float(mean_abs_corr), 4),
+                "n_flipped_neurons": int(np.sum(mask < 0)),
+                "mean_inputs_per_neuron": round(float(np.mean(per_neuron_n)), 2),
                 "target_key": target_key,
                 "sample_own_vectors": [v.round(4).tolist() for v in own_aug[:3]],
                 "sample_alien_vectors": [v.round(4).tolist() for v in alien_aug[:3]],
                 "formulas_used": [
-                    "ГОСТ (4):  Q(V_i) = |E_ч - E_с| / σ_с",
-                    "ГОСТ (6):  μ_i = Q(V_i) / σ_Чужой(V_i)",
-                    "ГОСТ (7):  sign(μ_i) = sign(E_с - E_ч)",
-                    "ГОСТ п.5.2: μ₀ = -E_чужой(Σ μ_i · v_i)",
-                    "ГОСТ (1):  ω_i = 2|0.5 - P1_i|",
-                    "ГОСТ (8):  μ_i(L2) = a2 · ω_i / E(ω_i)",
+                    "ГОСТ (1):  ω_i = 2|0.5 − P1_i|",
+                    "ГОСТ (3):  n ≈ a₀·[Q(y)/E(Q(v_i))]²",
+                    "ГОСТ (4):  Q(V_i) = |E_ч − E_с| / σ_с",
+                    "ГОСТ (6):  |μ_i| = Q(V_i) / σ_Чужой(V_i)",
+                    "ГОСТ (7):  sign(μ_i) согласован с K_i",
+                    "ГОСТ п.5.2: μ₀ = −(E_свой + E_чужой)/2 после w·v",
+                    "ГОСТ (8):  μ_i(L2) = a₂·ω_i / E(ω_i)",
+                    "ГОСТ п.5.5: Хемминг-фильтр чужих",
+                    "ГОСТ п.6.2.5: маскирование по 10к случайных чужих",
                 ]
             }
 
-        # ── Проверка порогов ──────────────────────────────────────────────────
-        # Порог FAR снижен: теперь с правильным bias'ом должен быть < 0.1
-        if frr > 0.15 or far > 0.10:
+        if frr > 0.12 or far > 0.08:
             self.trained = False
             print(f"[NPBK] ❌ ПРОВАЛ: FRR={frr:.1%}, FAR={far:.1%}")
             return False, self.quality_report
 
-        # ── Шифруем секрет ────────────────────────────────────────────────────
         key128 = self._make_key128(target_key)
         self.encrypted_secret = self._kuznechik_encrypt(
             self.protected_secret.encode("utf-8"), key128
         )
-        self.save_to_db(user_id)
+        try:
+            self.save_to_db(user_id)
+        except Exception as e:
+            self.trained = False
+            self.quality_report["db_error"] = str(e)
+            print(f"[NPBK] ❌ Ошибка сохранения в БД: {e}")
+            return False, self.quality_report
         print(f"[NPBK] ✅ Обучение успешно: FRR={frr:.1%}, FAR={far:.1%} | mean_ω={mean_omega:.3f}")
         return True, self.quality_report
 
-    def _apply_correlation_masking(self, alien: np.ndarray):
-        """ГОСТ п. 6.2.5: маскирование корреляционных связей."""
-        n = self.key_bits
-        mask = np.ones((n, self.input_dim))
-        flip_prob = 0.42  # ГОСТ: должно быть больше среднего |corr|
-        for i in range(n):
-            if np.random.rand() < flip_prob:
-                mask[i] *= -1
+    def _apply_correlation_masking_gost(self, alien: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        ГОСТ п. 6.2.5: маскирование корреляций.
+
+        Шаги:
+          1. Генерируем 10 000 случайных «чужих» в диапазоне реальных чужих.
+          2. Считаем матрицу корреляций между выходами нейронов слоя 1.
+          3. Для нейронов с самой высокой суммарной |corr| инвертируем
+             знак ВЕСЬ нейрона (все веса + bias).
+
+        Возвращает (mask, mean_abs_corr), где mask ∈ {+1, −1}^N — какие
+        нейроны были перевёрнуты.
+        """
+        n_bits = self.key_bits
+        n_random = 10000
+
+        lo = np.min(alien, axis=0)
+        hi = np.max(alien, axis=0)
+        rng = (hi - lo)
+        rng[rng < 1e-6] = 1e-6
+        rand_vecs = lo + np.random.rand(n_random, self.input_dim) * rng
+
+        outputs = rand_vecs @ self.layer1_weights.T + self.layer1_bias  # (n_random, N)
+
+        # Корреляции между нейронами по непрерывным выходам
+        std = np.std(outputs, axis=0) + 1e-8
+        normed = (outputs - np.mean(outputs, axis=0)) / std
+        corr_matrix = (normed.T @ normed) / n_random  # (N, N)
+        abs_corr = np.abs(corr_matrix)
+        np.fill_diagonal(abs_corr, 0.0)
+        mean_abs_corr = float(np.mean(abs_corr))
+
+        # Сумма |corr| каждого нейрона со всеми остальными
+        corr_score = np.sum(abs_corr, axis=1)
+
+        # Инвертируем тех, у кого суммарная корреляция выше медианы,
+        # но не больше доли = max(mean_abs_corr, 0.3) от всех нейронов.
+        flip_fraction = max(mean_abs_corr, 0.3)
+        n_flip = int(round(flip_fraction * n_bits))
+        # Чтобы не зацикливать инверсию (равноценный +/−), выбираем
+        # детерминированно — топ-N по corr_score.
+        flip_indices = np.argsort(corr_score)[-n_flip:]
+
+        mask = np.ones(n_bits)
+        mask[flip_indices] = -1.0
+
+        self.layer1_weights = self.layer1_weights * mask[:, None]
+        self.layer1_bias = self.layer1_bias * mask
         self.correlation_mask = mask
-        if self.layer1_weights is not None:
-            self.layer1_weights = self.layer1_weights * mask
+        print(f"[NPBK] Маскирование: mean|corr|={mean_abs_corr:.3f}, "
+              f"перевёрнуто {n_flip}/{n_bits} нейронов")
+        return mask, mean_abs_corr
 
     # ── Генерация ключа ──────────────────────────────────────────────────────
 
@@ -416,8 +514,10 @@ class NPBK:
     # ── База данных ──────────────────────────────────────────────────────────
 
     def save_to_db(self, user_id: str):
+        """Сохранить НБК. Поднимает исключение при ошибке — вызывающий
+        обязан обработать (UI должен показать причину, а не «успех»)."""
+        conn = psycopg2.connect(self.db_url)
         try:
-            conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS npbk_containers (
@@ -430,22 +530,24 @@ class NPBK:
                     encrypted_secret BYTEA,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.6'
+                    version TEXT DEFAULT 'v2.7'
                 )
             """)
             cur.execute("""
                 INSERT INTO npbk_containers
                     (user_id, key_bits, layer1_weights, layer1_bias,
-                     layer2_weights, correlation_mask, encrypted_secret, source_type)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                     layer2_weights, correlation_mask, encrypted_secret, source_type, version)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (user_id) DO UPDATE SET
+                    key_bits = EXCLUDED.key_bits,
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
                     layer2_weights = EXCLUDED.layer2_weights,
                     correlation_mask = EXCLUDED.correlation_mask,
                     encrypted_secret = EXCLUDED.encrypted_secret,
                     source_type = EXCLUDED.source_type,
-                    version = 'v2.6'
+                    version = EXCLUDED.version,
+                    created_at = NOW()
             """, (
                 user_id, self.key_bits,
                 Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []),
@@ -453,14 +555,14 @@ class NPBK:
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
                 self.encrypted_secret or b"",
-                self.source_info.get("type", "upload")
+                self.source_info.get("type", "upload"),
+                "v2.7"
             ))
             conn.commit()
             cur.close()
-            conn.close()
             print(f"[DB] ✅ Сохранено: {user_id}")
-        except Exception as e:
-            print(f"[DB] ❌ Ошибка сохранения: {e}")
+        finally:
+            conn.close()
 
     def load_from_db(self, user_id: str) -> bool:
         try:

@@ -135,14 +135,14 @@ class VoiceFeaturePipeline:
         return {
             "normalized_vector": normalized.tolist(),
             "raw_mean_vector": full_vec.tolist(),
-            "mfcc_rasta": mfcc_norm,
+            "mfcc_norm": mfcc_norm,
             "features": full_vec,
             "vad_mask": vad_mask,
             "y_pre": y_pre,
             "sr": sr,
             "dim": dim,
             "dim_label": dim_label,
-            "pipeline_version": "v2.41 debug"
+            "pipeline_version": "v2.42"
         }
 
     def get_audio_debug_info(self, audio_input: str | Path) -> Dict[str, Any]:
@@ -151,7 +151,7 @@ class VoiceFeaturePipeline:
             res = self.extract_features(audio_input)
             y = res["y_pre"]
             vad_mask = res["vad_mask"]
-            mfcc = res["mfcc_rasta"]
+            mfcc = res["mfcc_norm"]
             active = mfcc[:, vad_mask] if np.any(vad_mask) else mfcc
 
             speech_frames = int(np.sum(vad_mask))

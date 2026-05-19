@@ -41,8 +41,13 @@ except ImportError as e:
 
 # ── Глобальные объекты ──────────────────────────────────────────────────────
 pipeline = VoiceFeaturePipeline(use_rasta=False, use_deltas=False)
-npbk = NPBK(key_bits=64)
+npbk = NPBK(key_bits=128)
 loader = CVRuLoader()
+
+if not pipeline.normalizer.is_fitted():
+    print("[App] ⚠️ Нормализатор не обучен (models/audio_params/normalizer_params.json "
+          "отсутствует). Обучите его на вкладке 3 — без этого pipeline использует "
+          "локальный fallback и качество НПБК будет ниже.")
 
 global_speakers = load_speakers_with_audio()
 speaker_list = sorted([sid for sid, paths in global_speakers.items() if len(paths) >= 5])
@@ -233,7 +238,7 @@ def process_phrase(audio_input, speaker_id, mode, progress=gr.Progress()):
     progress(0.7, desc="Построение графиков...")
     y_pre = res["y_pre"]
     sr_val = res["sr"]
-    mfcc = res["mfcc_rasta"]
+    mfcc = res["mfcc_norm"]
     vec = res["normalized_vector"]
     raw_vec = res["raw_mean_vector"]
     vad_pct = float(np.mean(res["vad_mask"])) * 100
@@ -409,21 +414,37 @@ max: {[round(x, 3) for x in maxv]}
 # ── НПБК — Регистрация (вкладка 4) ──────────────────────────────────────────
 
 def morph_augment(vectors, target_count=11):
+    """
+    Линейный морфинг по ГОСТ Р 52633.2 — равномерные t_k = k/(N+1)
+    для каждой пары родителей.
+    """
     if len(vectors) >= target_count:
         return vectors
-    augmented = list(vectors)
-    src = list(vectors)
-    while len(augmented) < target_count:
-        if len(src) >= 2:
-            a, b = random.sample(src, 2)
-            alpha = random.uniform(0.2, 0.8)
-            morphed = (np.array(a) * alpha + np.array(b) * (1 - alpha)).tolist()
-            augmented.append(morphed)
-        else:
-            base = np.array(src[0])
-            noise = np.random.normal(0, 0.02, size=13)
-            augmented.append((base + noise).tolist())
-    return augmented[:target_count]
+    augmented = [np.array(v, dtype=np.float64) for v in vectors]
+    src = list(augmented)
+    n_src = len(src)
+
+    if n_src < 2:
+        base = src[0] if src else np.zeros(13)
+        while len(augmented) < target_count:
+            augmented.append((base + np.random.normal(0, 0.02, len(base))))
+        return [v.tolist() for v in augmented[:target_count]]
+
+    # Все пары + равномерные t_k. n_children подбирается так, чтобы хватило.
+    pairs = [(i, j) for i in range(n_src) for j in range(i + 1, n_src)]
+    needed = target_count - len(augmented)
+    per_pair = max(1, -(-needed // len(pairs)))  # ceil
+    for (i, j) in pairs:
+        A, B = src[i], src[j]
+        for k in range(1, per_pair + 1):
+            t = k / (per_pair + 1)
+            augmented.append(A + t * (B - A))
+            if len(augmented) >= target_count:
+                break
+        if len(augmented) >= target_count:
+            break
+
+    return [v.tolist() for v in augmented[:target_count]]
 
 
 def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progress=gr.Progress()):
@@ -552,7 +573,26 @@ Bias (μ₀):  = -E_чужой(Σ μ_i · v_i)
     if not success:
         with _trained_lock:
             trained_speakers.discard(speaker_id or user_name)
-        fail_md = f"""
+        db_err = quality.get("db_error")
+        if db_err:
+            fail_md = f"""
+**❌ Обучение прошло, но не удалось сохранить в БД**
+
+| Метрика | Значение |
+|---|---|
+| FRR | {quality['FRR']:.1%} |
+| FAR | {quality['FAR']:.1%} |
+
+**Причина:** `{db_err}`
+
+Проверьте, что PostgreSQL запущен:
+```
+docker compose up -d db
+```
+{debug_md}
+"""
+        else:
+            fail_md = f"""
 **❌ Обучение провалено**
 
 | Метрика | Значение | Норма |
@@ -586,10 +626,22 @@ Bias (μ₀):  = -E_чужой(Σ μ_i · v_i)
     # Метрики для трёх отдельных компонентов
     layer1_q = round(np.mean([abs(np.mean(v) - 0.5) for v in vectors]), 4)
     layer2_q = round(float(quality.get("mean_Q", 0)), 4)
-    eer_val = float(pipeline.compute_eer(
-        [0.9] * len(vectors),
-        [0.1] * len(alien[:80])
-    ))
+
+    # Реальный EER: скоры близости к target_key через долю совпадающих бит.
+    target_bits = (debug or {}).get("target_key", "")
+    if target_bits and npbk.trained:
+        def _bit_score(v):
+            k = npbk.generate_key(v)
+            n = min(len(k), len(target_bits))
+            return sum(1 for i in range(n) if k[i] == target_bits[i]) / n if n else 0.0
+        own_scores = [_bit_score(v) for v in vectors]
+        alien_scores = [_bit_score(v) for v in alien[:80]]
+        try:
+            eer_val = float(pipeline.compute_eer(own_scores, alien_scores))
+        except Exception:
+            eer_val = float("nan")
+    else:
+        eer_val = float("nan")
 
     success_md = f"""
 **✅ Обучение успешно! (Dasha v2.5)**
@@ -653,13 +705,7 @@ def recover_key(nbk_record, audio, progress=gr.Progress()):
     try:
         internal_key = npbk.generate_key(vec)
         if npbk.encrypted_secret:
-            key_bytes = bytes(
-                int(internal_key[i:i + 8], 2) for i in range(0, min(len(internal_key), 128), 8)
-            )
-            # Дополняем до 16 байт если нужно
-            key_bytes = key_bytes.ljust(16, b"\x00")[:16]
-            decrypted = npbk._kuznechik_decrypt(npbk.encrypted_secret, key_bytes)
-            original_secret = decrypted.decode("utf-8", errors="replace").rstrip("\x00")
+            original_secret = npbk.decrypt_secret(internal_key)
         else:
             original_secret = "(старый формат — секрет не сохранён)"
     except Exception as e:
