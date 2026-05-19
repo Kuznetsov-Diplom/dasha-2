@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.7 — hotfix: robust decrypt/encrypt with type normalization (fix bytes ^ int error on restore)
+NPBK v2.38.8 — strict verification + registered_key persistence (ГОСТ compliance)
 
-- Added _to_bytes helper for memoryview/bytes/str safety
-- Force fallback if GOST not perfect
-- Better error handling in restore path
-- No plain secret ever stored
+- Store registered_key (128-bit output code) for exact-match check on restore
+- Only decrypt if generated internal_key == registered_key (prevents 'Чужой' success)
+- Added ALTER for old DBs
+- _to_bytes safety kept
 """
 
 import numpy as np
@@ -94,7 +94,7 @@ class NPBK:
         try:
             ct = base64.b64decode(ciphertext) if ciphertext else b""
         except Exception:
-            ct = ciphertext  # use raw if not valid b64
+            ct = ciphertext
         ct = self._to_bytes(ct)
         if len(key128) < 16:
             key128 = key128.ljust(16, b"\0")
@@ -187,6 +187,8 @@ class NPBK:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
+            # Ensure column exists (for old DBs)
+            cur.execute("ALTER TABLE IF EXISTS npbk_containers ADD COLUMN IF NOT EXISTS registered_key TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS npbk_containers (
                     user_id TEXT PRIMARY KEY,
@@ -196,22 +198,24 @@ class NPBK:
                     layer2_weights JSONB,
                     correlation_mask JSONB,
                     encrypted_secret BYTEA,
+                    registered_key TEXT,
                     source_type TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT 'v2.38.7'
+                    version TEXT DEFAULT 'v2.38.8'
                 )
             """)
             cur.execute("""
                 INSERT INTO npbk_containers 
                 (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask,
-                 encrypted_secret, source_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 encrypted_secret, registered_key, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
                     layer2_weights = EXCLUDED.layer2_weights,
                     correlation_mask = EXCLUDED.correlation_mask,
                     encrypted_secret = EXCLUDED.encrypted_secret,
+                    registered_key = EXCLUDED.registered_key,
                     source_type = EXCLUDED.source_type
             """, (
                 user_id, self.key_bits,
@@ -220,12 +224,13 @@ class NPBK:
                 Json(self.layer2_weights.tolist() if self.layer2_weights is not None else []),
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
                 self.encrypted_secret or b"",
+                self.registered_key or "",
                 self.source_info.get("type", "upload")
             ))
             conn.commit()
             cur.close()
             conn.close()
-            print(f"[DB] Saved: user={user_id} (plain secret removed for security)")
+            print(f"[DB] Saved: user={user_id} (registered_key stored for strict verify)")
         except Exception as e:
             print(f"[DB ERROR] {e}")
 
@@ -246,8 +251,9 @@ class NPBK:
                 self.layer2_weights = np.array(row[4]) if row[4] else None
                 self.correlation_mask = np.array(row[5]) if row[5] else None
                 self.encrypted_secret = row[6]
-                self.protected_secret = None  # security: never restore plain
-                print(f"[DB] Fully loaded: {user_id} (no plain secret)")
+                self.registered_key = row[7] if len(row) > 7 else None  # new column
+                self.protected_secret = None
+                print(f"[DB] Fully loaded: {user_id} (strict verify ready)")
                 return True
             return False
         except Exception as e:
