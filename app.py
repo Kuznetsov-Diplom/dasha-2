@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Dasha v2.38.3 — hotfix Gradio 6.0 warning + DB schema
+Dasha v2.38.7 — hotfix restore error (bytes ^ int fixed in NPBK) + typo fix + Gradio 6.0
 
-- Moved theme= to launch() (Gradio 6.0 compatibility)
-- npbk.py now compatible with existing DB table
+- npbk.py v2.38.7 with _to_bytes robust handling
+- Fixed "Востановление" -> "Восстановление"
+- Better error messages in recover
+- Always push after fixes per rules
 """
 
 import gradio as gr
@@ -174,7 +176,7 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
     user_id = nbk_record.split(" | ")[0]
     loaded = npbk.load_from_db(user_id)
     if not loaded:
-        return f"Не удалос загрузить НПБК для {user_id}", None, None, None, None, None
+        return f"Не удалось загрузить НПБК для {user_id}", None, None, None, None, None
 
     progress(0.3, desc="Подготовка голоса...")
     path = None
@@ -228,16 +230,16 @@ def recover_key(nbk_record, audio, use_auto, selected_phrase, progress=gr.Progre
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.38.3 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
+with gr.Blocks(title="Dasha v2.38.7 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.38.3 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.38.7 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
 
     with gr.Row():
         btn_menu_reg = gr.Button("📝 1. Регистрация НПБК", variant="primary", size="lg", scale=1)
-        btn_menu_rec = gr.Button("🔑 2. Востановление ключа", variant="secondary", size="lg", scale=1)
+        btn_menu_rec = gr.Button("🔑 2. Восстановление ключа", variant="secondary", size="lg", scale=1)
 
     gr.Markdown("---")
 
@@ -272,15 +274,15 @@ with gr.Blocks(title="Dasha v2.38.3 — Биометрия по голосу (Г
                 reg_status = gr.Markdown()
 
     with gr.Group(visible=False) as rec_group:
-        gr.Markdown("## 🔑 Востановление ключа")
+        gr.Markdown("## 🔑 Восстановление ключа")
         gr.Markdown("Выберите обученную запись НБК и предъявите свой голос")
 
         with gr.Row():
             with gr.Column():
                 btn_refresh = gr.Button("🔄 Обновить список обученных НБК", size="sm")
                 nbk_dd = gr.Dropdown(choices=get_nbk_records(), label="Обученные записи НПБК", info="При выборе авто-подставится спикер и фразы")
-                audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузрузка файла) — всегда доступно")
-                btn_recover = gr.Button("🔑 Востановить ключ", variant="primary", size="lg")
+                audio_rec = gr.Audio(sources=["microphone", "upload"], type="numpy", label="🎤 Ваша запись голоса (микрофон + загрузка файла) — всегда доступно")
+                btn_recover = gr.Button("🔑 Восстановить ключ", variant="primary", size="lg")
 
             with gr.Column():
                 rec_md = gr.Markdown()
@@ -296,7 +298,7 @@ with gr.Blocks(title="Dasha v2.38.3 — Биометрия по голосу (Г
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
 
-    **Dasha v2.38.3 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.38.7 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
     """)
 
     def switch_to_reg():
