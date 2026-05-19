@@ -114,10 +114,11 @@ class NPBK:
             return data
 
     def train(self, own_vectors: List[List[float]], alien_vectors: List[List[float]], 
-              user_id: str = "default", source_info: Optional[Dict] = None):
+              user_id: str = "default", source_info: Optional[Dict] = None, protected_secret: Optional[str] = None):
         """Полное обучение по ГОСТ Р 52633.5-2011 с размножением, метриками, 2 слоями, тестами ошибок, шифрованием"""
         source_info = source_info or {"type": "upload", "speaker_id": None, "files": None}
         self.source_info = source_info
+        self.protected_secret = protected_secret or "default_protected_secret_2026"  # ← МИНИМАЛЬНЫЙ ФИКС: добавлено для совместимости с app.py
 
         own = np.array(own_vectors, dtype=np.float64)
         alien = np.array(alien_vectors, dtype=np.float64)
@@ -138,7 +139,8 @@ class NPBK:
         # Все векторы уже прошли pipeline (MFCC+CMVN) — готово к обучению
 
         E_own, sigma_own = self._compute_stats(own)
-        E_alien, sigma_alien = self._compute_stats(alien)
+        E_alien = self._compute_stats(alien)[0]
+        sigma_alien = self._compute_stats(alien)[1]
 
         n_neurons = self.key_bits
         layer1_w = np.zeros((n_neurons, self.input_dim))
@@ -200,8 +202,8 @@ class NPBK:
         self.registered_key = ''.join(map(str, registered_key_bits))
         print(f"[Ключ] Сгенерирован 128-битный двоичный ключ: {self.registered_key[:32]}... (полный в generate_key)")
 
-        # 9. Шифрование секрета пользователя Кузнечиком (ключ = binary key)
-        user_secret = b"user_protected_secret_v2.35"  # демо-секрет (в реале — от пользователя)
+        # 9. Шифрование секрета пользователя Кузнечиком (ключ = binary key) — используем protected_secret из UI (часть 1)
+        user_secret = (self.protected_secret or "user_protected_secret_v2.35").encode('utf-8')
         key_bytes = bytes(int(self.registered_key[i:i+8], 2) for i in range(0, 128, 8))  # 16 байт из 128 бит
         self.encrypted_secret = self._kuznechik_encrypt(user_secret, key_bytes)
         print(f"[Защита] Секрет пользователя зашифрован Кузнечиком (ключ = 128-битный биометрический ключ)")
