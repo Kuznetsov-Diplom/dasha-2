@@ -599,7 +599,7 @@ docker compose up -d db
 |---|---|---|
 | FRR | {quality['FRR']:.1%} | < 12% |
 | FAR | {quality['FAR']:.1%} | < 8% |
-| mean\|μ\| | {quality.get('mean_|mu|', 0):.3f} | < 30 |
+| mean\\|μ\\| | {quality.get('mean_|mu|', 0):.3f} | < 30 |
 | mean_Q | {quality.get('mean_Q', 0):.4f} | — |
 
 **Рекомендации:**
@@ -652,7 +652,7 @@ docker compose up -d db
 | FRR | **{quality['FRR']:.1%}** |
 | FAR | **{quality['FAR']:.1%}** |
 | EER | {eer_val} |
-| mean\|μ\| | {quality.get('mean_|mu|', 0):.3f} |
+| mean\\|μ\\| | {quality.get('mean_|mu|', 0):.3f} |
 | mean_Q | {quality.get('mean_Q', 0):.4f} |
 | База «Чужой» | {foreign_info} ({len(alien)} примеров) |
 | Версия | {quality.get('version', '—')} |
