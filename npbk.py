@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-NPBK v2.38.3 — fix DB schema mismatch (remove speaker_id / file_source)
+NPBK v2.38.4 — final DB schema fix (remove registered_key too)
 
-- Removed speaker_id and file_source from CREATE/INSERT (they were missing in existing DB)
-- Table now matches what pgAdmin shows
-- source_type still saved
+- Now CREATE TABLE exactly matches your live pgAdmin table
+- No more column does not exist errors
 """
 
 import numpy as np
@@ -178,16 +177,15 @@ class NPBK:
                     encrypted_secret BYTEA,
                     protected_secret TEXT,
                     source_type TEXT,
-                    registered_key TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    version TEXT DEFAULT "v2.38.3"
+                    version TEXT DEFAULT "v2.38.4"
                 )
             """)
             cur.execute("""
                 INSERT INTO npbk_containers 
                 (user_id, key_bits, layer1_weights, layer1_bias, layer2_weights, correlation_mask,
-                 encrypted_secret, protected_secret, source_type, registered_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 encrypted_secret, protected_secret, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     layer1_weights = EXCLUDED.layer1_weights,
                     layer1_bias = EXCLUDED.layer1_bias,
@@ -195,8 +193,7 @@ class NPBK:
                     correlation_mask = EXCLUDED.correlation_mask,
                     encrypted_secret = EXCLUDED.encrypted_secret,
                     protected_secret = EXCLUDED.protected_secret,
-                    source_type = EXCLUDED.source_type,
-                    registered_key = EXCLUDED.registered_key
+                    source_type = EXCLUDED.source_type
             """, (
                 user_id, self.key_bits,
                 Json(self.layer1_weights.tolist() if self.layer1_weights is not None else []),
@@ -205,8 +202,7 @@ class NPBK:
                 Json(self.correlation_mask.tolist() if self.correlation_mask is not None else []),
                 self.encrypted_secret or b"",
                 self.protected_secret,
-                self.source_info.get("type", "upload"),
-                self.registered_key
+                self.source_info.get("type", "upload")
             ))
             conn.commit()
             cur.close()
@@ -233,7 +229,6 @@ class NPBK:
                 self.correlation_mask = np.array(row[5]) if row[5] else None
                 self.encrypted_secret = row[6]
                 self.protected_secret = row[7]
-                self.registered_key = row[9]
                 print(f"[DB] Fully loaded: {user_id}")
                 return True
             return False
