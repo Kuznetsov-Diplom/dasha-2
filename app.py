@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Dasha v2.38.10 — quality gate + no registered_key
+Dasha v2.39 — quality gate + no registered_key + enhanced debug
 
-- train() теперь возвращает (success: bool, report: dict)
-- Если FRR > 10% или плохое качество — обучение провалено, не сохраняем
-- Показываем FRR/FAR в интерфейсе
+- После фикса NPBK (v2.39) FAR должен упасть
+- Добавлена отладочная информация: mean_Q, mean_|mu|, per-feature stats (если нужно расширить)
+- В success md теперь показываем "Отладка ГОСТ: ..."
 """
 
 import gradio as gr
@@ -141,7 +141,8 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
             f"**❌ ОБУЧЕНИЕ ПРОВАЛЕНО!**\n\n"
             f"- FRR (ошибка 1 рода): {quality['FRR']:.1%}\n"
             f"- FAR (ошибка 2 рода): {quality['FAR']:.1%}\n\n"
-            f"Попробуйте ещё раз с более стабильными записями голоса.",
+            f"**Отладка ГОСТ v2.39:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}\n"
+            f"Попробуйте ещё раз с более стабильными записями голоса (больше фраз, тише фон).",
             None, None, None, None, None, None, None
         )
 
@@ -163,15 +164,18 @@ def register_npbk(mode, audio_files, speaker_id, user_name, desired_key, progres
     foreign_info = ", ".join([f"{s[:12]}... ({len(global_speakers.get(s,[]))} фраз)" for s in other_speakers[:4]])
 
     md = f"""
-    **✅ Обучение успешно!**
+    **✅ Обучение успешно! (Dasha v2.39)**
 
     - Пользователь: **{user_name}**
     - Ваш ключ (protected_secret): `{desired_key}` ← **этот ключ теперь защищён биометрией**
     - Internal key (NPBK): `{internal_key[:32]}...`
-    - FRR (ошибка 1 рода): {quality['FRR']:.1%} | FAR (ошибка 2 рода): {quality['FAR']:.1%}
+    - **FRR (ошибка 1 рода): {quality['FRR']:.1%}** | **FAR (ошибка 2 рода): {quality['FAR']:.1%}**
     - EER: {eer}
+    - **Отладка ГОСТ:** mean|μ|={quality.get('mean_|mu|', 0):.3f}, mean_Q={quality.get('mean_Q', 0):.3f}, уникальных ключей у чужих: {quality.get('unique_alien_keys', 0)}/{quality.get('num_alien_tested', 0)}
     - База «Чужой»: {foreign_info} (всего {len(alien)} примеров)
     **Чтобы получить ключ снова — только через правильную биометрию!**
+    
+    *Если FAR всё ещё >5% — попробуй больше примеров своего голоса (15+) или другой спикер.*
     """
 
     return md, vec_plot, key_plot, f"Слой 1: {layer1_q}", f"Слой 2: {layer2_q}", f"EER: {eer}", internal_key, "✅ Ключ защищён в PostgreSQL. Перейдите на вкладку Восстановление."
@@ -233,9 +237,9 @@ def recover_key(nbk_record, audio, progress=gr.Progress()):
 
     return md, vec_plot, original_secret, "Восстановление успешно! Ключ получен только благодаря правильной биометрии.", foreign_md, ""
 
-with gr.Blocks(title="Dasha v2.38.10 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
+with gr.Blocks(title="Dasha v2.39 — Биометрия по голосу (ГОСТ Р 52633.5)") as demo:
     gr.Markdown("""
-    # 🛡️ Dasha v2.38.10 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
+    # 🛡️ Dasha v2.39 — Нейросетевой преобразователь биометрия → код по ГОСТ Р 52633.5-2011
 
     **protected_secret** (ваш ключ) → защищается **internal_key** (НПБК) | Восстановление — только при правильной биометрии
     """)
@@ -300,9 +304,9 @@ with gr.Blocks(title="Dasha v2.38.10 — Биометрия по голосу (�
     - Раздельное обучение нейронов
     - Морфинг примеров (< 11)
     - 60+ примеров «Чужой»
-    - **Автоматическая оценка FRR/FAR после обучения**
+    - **Автоматическая оценка FRR/FAR после обучения + отладка mean_Q / |μ|**
 
-    **Dasha v2.38.10 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс**
+    **Dasha v2.39 | Май 2026 | Полное соответствие ГОСТ + красивый интерфейс + исправленный NPBK**
     """)
 
     def switch_to_reg():
